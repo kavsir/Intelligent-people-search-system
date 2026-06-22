@@ -1,0 +1,24 @@
+# Virtual Environment
+.venv/
+venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/
+
+# Environment Variables
+.env
+
+# Models (nếu model lớn)
+*.pt
+*.pth
+*.onnx
+
+# Build
+build/
+dist/

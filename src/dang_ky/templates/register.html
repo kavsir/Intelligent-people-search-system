@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Đăng ký khuôn mặt AIoT</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Hệ Thống Đăng Ký Khuôn Mặt</h1>
+        <!-- Khối chuyển đổi tab -->
+        <div class="tab-header">
+            <button class="tab-btn active" data-tab="upload">📁 Chọn ảnh từ máy</button>
+            <button class="tab-btn" data-tab="webcam">📷 Chụp ảnh Webcam (5 Góc)</button>
+        </div>
+        
+        <!-- Nội dung Tab 1: Upload ảnh tĩnh -->
+        <div class="tab-content">
+            <div id="tab-upload" class="tab-panel active">
+                <div class="upload-area">
+                    <input type="file" id="imageInput" accept="image/*">
+                    <div id="preview-container">
+                        <canvas id="uploadCanvas"></canvas>
+                    </div>
+                    <div id="upload-status" class="status-msg"></div>
+                </div>
+                <div class="name-input">
+                    <label for="uploadName">Nhập tên người đăng ký:</label>
+                    <input type="text" id="uploadName" placeholder="Ví dụ: NguyenVanA">
+                    <button id="saveUploadBtn">💾 Lưu đăng ký ảnh</button>
+                </div>
+            </div>
+
+            <!-- Nội dung Tab 2: Workflow Webcam đa góc độ -->
+            <div id="tab-webcam" class="tab-panel">
+                <div class="webcam-area">
+                    <video id="webcamVideo" autoplay playsinline></video>
+                    <canvas id="webcamCanvas" style="display:none;"></canvas>
+                    
+                    <div class="webcam-controls">
+                        <button id="captureBtn">📸 Chụp ảnh góc này</button>
+                        <button id="resetCaptureBtn" class="btn-danger">🔄 Chụp ảnh lại từ đầu</button>
+                        <span id="angle-hint">Góc: Đang tải dữ liệu...</span>
+                        <span id="capture-count">Đã chụp: 0/5</span>
+                    </div>
+                    
+                    <div id="webcam-status" class="status-msg"></div>
+                    <!-- Danh sách hiển thị ảnh 5 góc độ kèm nhãn tên tư thế -->
+                    <div id="captured-preview"></div>
+                </div>
+                <div class="name-input">
+                    <label for="webcamName">Nhập tên người đăng ký:</label>
+                    <input type="text" id="webcamName" placeholder="Ví dụ: NguyenVanA">
+                    <button id="saveWebcamBtn">💾 Lưu dữ liệu 5 góc</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
