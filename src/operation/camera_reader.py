@@ -1,7 +1,18 @@
+"""
+Background thread that continuously reads frames from the ESP32-S3-CAM
+MJPEG stream and exposes the latest frame in a thread-safe way.
+"""
+
+import os
+import sys
 import threading
 import time
+
 import cv2
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+
 
 class CameraReader(threading.Thread):
     def __init__(self):
@@ -10,12 +21,12 @@ class CameraReader(threading.Thread):
         self.cap = None
         self.frame = None
         self.ret = False
-        self.lock = threading.Lock() # Khóa an toàn đa luồng
+        self.lock = threading.Lock()
         self.running = True
-        self.daemon = True           # Tự động tắt thread này khi kết thúc hàm main
+        self.daemon = True
 
     def run(self):
-        print(f"[CameraReader] Đang kết nối tới ESP32-S3-CAM tại: {self.url} ...")
+        print(f"[CameraReader] Connecting to ESP32-S3-CAM at: {self.url} ...")
         self.cap = cv2.VideoCapture(self.url)
 
         while self.running:
@@ -26,12 +37,12 @@ class CameraReader(threading.Thread):
                         self.frame = frame
                         self.ret = True
                 else:
-                    print("[CameraReader] Cảnh báo: Mất gói tin hoặc khung hình lỗi. Đang kết nối lại...")
+                    print("[CameraReader] Warning: dropped frame. Reconnecting...")
                     self.cap.release()
                     time.sleep(1)
                     self.cap = cv2.VideoCapture(self.url)
             else:
-                print("[CameraReader] LỖI: Không thể mở luồng stream. Đang thử lại sau 2 giây...")
+                print("[CameraReader] ERROR: could not open stream. Retrying in 2s...")
                 time.sleep(2)
                 self.cap = cv2.VideoCapture(self.url)
 
@@ -39,10 +50,10 @@ class CameraReader(threading.Thread):
             self.cap.release()
 
     def get_frame(self):
-        """Hàm an toàn giúp luồng chính lấy ra khung hình mới nhất"""
+        """Thread-safe accessor for the most recent frame."""
         with self.lock:
             if self.ret and self.frame is not None:
-                return True, self.frame.copy() # Trả về bản sao để tránh xung đột vùng nhớ
+                return True, self.frame.copy()
             return False, None
 
     def stop(self):

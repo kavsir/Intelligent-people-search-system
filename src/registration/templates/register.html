@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIoT Face Registration</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Face Registration System</h1>
+        <!-- Tab switcher -->
+        <div class="tab-header">
+            <button class="tab-btn active" data-tab="upload">📁 Choose image from device</button>
+            <button class="tab-btn" data-tab="webcam">📷 Capture via webcam (5 angles)</button>
+        </div>
+
+        <!-- Tab 1: static image upload -->
+        <div class="tab-content">
+            <div id="tab-upload" class="tab-panel active">
+                <div class="upload-area">
+                    <input type="file" id="imageInput" accept="image/*">
+                    <div id="preview-container">
+                        <canvas id="uploadCanvas"></canvas>
+                    </div>
+                    <div id="upload-status" class="status-msg"></div>
+                </div>
+                <div class="name-input">
+                    <label for="uploadName">Person's name:</label>
+                    <input type="text" id="uploadName" placeholder="e.g. JohnSmith">
+                    <button id="saveUploadBtn">💾 Save registration</button>
+                </div>
+            </div>
+
+            <!-- Tab 2: multi-angle webcam workflow -->
+            <div id="tab-webcam" class="tab-panel">
+                <div class="webcam-area">
+                    <video id="webcamVideo" autoplay playsinline></video>
+                    <canvas id="webcamCanvas" style="display:none;"></canvas>
+
+                    <div class="webcam-controls">
+                        <button id="captureBtn">📸 Capture this angle</button>
+                        <button id="resetCaptureBtn" class="btn-danger">🔄 Start over</button>
+                        <span id="angle-hint">Angle: Loading...</span>
+                        <span id="capture-count">Captured: 0/5</span>
+                    </div>
+
+                    <div id="webcam-status" class="status-msg"></div>
+                    <!-- Preview grid of the 5 captured angles -->
+                    <div id="captured-preview"></div>
+                </div>
+                <div class="name-input">
+                    <label for="webcamName">Person's name:</label>
+                    <input type="text" id="webcamName" placeholder="e.g. JohnSmith">
+                    <button id="saveWebcamBtn">💾 Save 5-angle dataset</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
