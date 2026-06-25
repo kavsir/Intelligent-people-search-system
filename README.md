@@ -44,28 +44,6 @@ Hệ thống AIoT nhận diện và bám theo khuôn mặt người đã đăng 
 
 ---
 
-## 📁 Cấu trúc dự án
-
-```
-project/
-├── main.py                 # Khởi động 4 threads chính
-├── camera.py               # Đọc MJPEG stream từ ESP32-S3-CAM
-├── detector.py             # YOLOv8n-face + InsightFace recognition
-├── tracker.py              # CSRT Tracker + fallback person detection
-├── kalman.py               # Kalman Filter làm mượt tọa độ
-├── priority_manager.py     # Logic ưu tiên: bám người xuất hiện trước
-├── behavior.py             # MediaPipe Pose + phân loại hành vi
-├── controller.py           # PID Controller + giao tiếp Serial servo
-├── dashboard.py            # Streamlit UI realtime
-├── register_face.py        # Đăng ký khuôn mặt qua video trực tiếp
-├── face_db/
-│   ├── person_a.npy        # Embedding vector 512D người A
-│   └── person_b.npy        # Embedding vector 512D người B
-├── requirements.txt
-└── README.md
-```
-
----
 
 ## ⚙️ Cài đặt
 
