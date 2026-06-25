@@ -1,18 +1,20 @@
-
---extra-index-url https://download.pytorch.org/whl/cu128
-
-torch 
-torchvision --index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
 torchaudio
+
 ultralytics
 insightface
-onnxruntime-gpu
+
 opencv-python
 pyserial
 numpy
 scipy
 transformers
-mediapipe 
+mediapipe
 flask
 rembg
-huggingface_hub --break-system-packages
+huggingface_hub
+
+onnxruntime==1.20.1
+
+--extra-index-url https://download.pytorch.org/whl/cu128

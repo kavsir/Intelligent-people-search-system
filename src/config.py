@@ -72,7 +72,7 @@ PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
 # ---------------------------------------------------------------------------
 # Change to "http://192.168.0.10/stream" or "http://192.168.0.10:81/stream"
 # depending on your firmware.
-CAMERA_URL = "http://10.145.30.117/stream"
+CAMERA_URL = "http://192.168.0.10/stream"
 
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
@@ -88,7 +88,39 @@ YOLO_PERSON_MODEL_PATH = os.path.join(MODELS_DIR, "yolov8n.pt")
 AI_CONF_THRESHOLD = 0.5
 
 # ---------------------------------------------------------------------------
+# Face recognition (InsightFace)
+# ---------------------------------------------------------------------------
+# Minimum cosine similarity (normed embeddings -> plain dot product) for a
+# detected face to be considered a match for a registered person. Lower this
+# (e.g. 0.4) if recognition feels too strict; raise it if strangers are
+# getting matched to a registered name.
+FACE_RECOGNITION_THRESHOLD = 0.5
+
+# How many AI-pipeline steps to wait between identity re-checks while a face
+# is already locked and tracked by CSRT. Identity doesn't need to be
+# re-verified every frame -- this just confirms we're still tracking the
+# right person.
+IDENTITY_RECHECK_INTERVAL = 10
+
+# ---------------------------------------------------------------------------
+# Target-loss safety behavior
+# ---------------------------------------------------------------------------
+# Seconds of consecutive "no target" frames tolerated before the FSM
+# actually declares the target lost. Prevents 1-2 frame detection hiccups
+# from flapping the state (and the servo) back and forth.
+LOST_GRACE_PERIOD_SEC = 1.0
+
+# ---------------------------------------------------------------------------
 # Servo / serial
 # ---------------------------------------------------------------------------
-SERVO_PORT = "COM8"          # e.g. "COM5" on Windows, "/dev/ttyUSB0" on Linux
+SERVO_PORT = "COM5"          # e.g. "COM5" on Windows, "/dev/ttyUSB0" on Linux
 SERVO_BAUDRATE = 115200
+
+# Ignore target offsets smaller than this many pixels (keeps the servo from
+# hunting/jittering when the target is already close enough to center).
+SERVO_DEADZONE_PX = 15
+
+# Maximum degrees the pan/tilt angle is allowed to change in a single
+# control step, regardless of what the PID output says. Prevents sudden
+# jerky motion, e.g. right after switching tracking targets.
+SERVO_MAX_DEGREE_STEP = 3.0

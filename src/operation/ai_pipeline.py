@@ -1,12 +1,24 @@
 """
-AI tracking pipeline: a finite state machine that prioritizes face
-tracking (cheap CSRT tracker, periodically re-validated by YOLO-face) and
-falls back to person tracking (YOLO-person) when the face is lost.
+AI tracking pipeline: a finite state machine that prioritizes face tracking
+(cheap CSRT tracker, periodically re-validated by YOLO-face) and falls back
+to person tracking (YOLO-person) when the face is lost.
+
+Unlike the first version of this file, this pipeline only locks onto a
+*registered* person (matched via FaceRecognizer against data/face_db/) --
+an unrecognized face is reported but never tracked. This is what connects
+the registration app's output to the operation app, which was previously
+missing entirely.
 
 States:
-    SEARCHING       -> no target yet, scanning every frame
-    TRACKING_FACE   -> locked onto a face, tracked cheaply via CSRT
-    FALLBACK_PERSON -> face lost, tracking the person's body instead
+    SEARCHING       -> no locked target yet, scanning every frame
+    TRACKING_FACE   -> locked onto a registered face, tracked via CSRT
+    FALLBACK_PERSON -> face lost, tracking the same person's body instead
+    LOST            -> target missing for longer than the grace period;
+                       servo holds its last position (see ServoController)
+
+IGNORE is not a separate FSM state here -- it's simply what happens when a
+detected face does not match anyone in face_db: it's logged but ignored,
+and the FSM stays in SEARCHING.
 """
 
 import os
@@ -20,6 +32,8 @@ from ultralytics import YOLO
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from operation.event_logger import EventLogger
+from operation.face_recognizer import FaceRecognizer
 
 
 class KalmanFilter2D:
@@ -50,11 +64,25 @@ class KalmanFilter2D:
         self.initialized = False
 
 
+def _crop_safe(frame, bbox):
+    """Crop a bbox out of frame, clamped to image bounds. Returns None if empty."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame[y1:y2, x1:x2]
+
+
 class AIPipeline(threading.Thread):
-    def __init__(self, camera_thread):
+    def __init__(self, camera_thread, event_logger=None):
         super().__init__()
         self.camera_thread = camera_thread
         self.running = True
+        self.daemon = True
+
+        self.logger = event_logger or EventLogger()
 
         # --- Load models ---
         print("[AI] Loading AI models...")
@@ -64,9 +92,26 @@ class AIPipeline(threading.Thread):
         self.yolo_person = YOLO(config.YOLO_PERSON_MODEL_PATH)
         try:
             self.yolo_face = YOLO(config.YOLO_FACE_MODEL_PATH)
+            self._face_model_ok = True
         except Exception:
-            print("[AI] Face model not found, using person model as fallback.")
+            print(
+                "[AI] WARNING: face model not found at "
+                f"{config.YOLO_FACE_MODEL_PATH}. Falling back to the person "
+                "model for face detection -- face tracking will NOT work "
+                "correctly until yolov8n-face.pt is in place (see "
+                "download_model.py)."
+            )
             self.yolo_face = self.yolo_person
+            self._face_model_ok = False
+
+        self.recognizer = FaceRecognizer()
+        self.recognizer.load_database()
+        if self.recognizer.is_empty():
+            print(
+                "[AI] WARNING: face_db is empty. No registered person can be "
+                "tracked until at least one person is registered via the "
+                "registration app."
+            )
 
         self.kalman = KalmanFilter2D()
 
@@ -74,6 +119,7 @@ class AIPipeline(threading.Thread):
         self.STATE_SEARCHING = "SEARCHING"
         self.STATE_TRACKING_FACE = "TRACKING_FACE"
         self.STATE_FALLBACK_PERSON = "FALLBACK_PERSON"
+        self.STATE_LOST = "LOST"
         self.current_state = self.STATE_SEARCHING
 
         # --- Classic tracker (CSRT) ---
@@ -87,12 +133,25 @@ class AIPipeline(threading.Thread):
         self.fallback_face_check_counter = 0
         self.FALLBACK_FACE_CHECK_INTERVAL = 3
 
-        # --- Output state ---
+        # --- Identity tracking ---
+        self.locked_identity = None  # name of the person currently locked on
+
+        # --- Lost-target debounce (avoids 1-2 frame flicker flapping state) ---
+        self.LOST_GRACE_PERIOD_SEC = config.LOST_GRACE_PERIOD_SEC
+        self._target_missing_since = None
+
+        # --- Output state (protected by _lock since the servo/dashboard
+        # threads read it concurrently with this thread writing it) ---
+        self._lock = threading.Lock()
         self.has_target = False
         self.raw_bbox = None
         self.smoothed_bbox = None
         self.target_center = None
+        self.last_step_latency_ms = 0.0
 
+    # -----------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------
     def _init_csrt_tracker(self, frame, bbox):
         """(Re)initialize the OpenCV CSRT tracker on the given bbox."""
         try:
@@ -105,8 +164,43 @@ class AIPipeline(threading.Thread):
         self.tracker.init(frame, (x1, y1, w, h))
         self.validate_counter = 0
 
+    def _set_output(self, has_target, raw_bbox, smoothed_bbox, target_center):
+        with self._lock:
+            self.has_target = has_target
+            self.raw_bbox = raw_bbox
+            self.smoothed_bbox = smoothed_bbox
+            self.target_center = target_center
+
+    def _clear_target(self, reset_kalman=True):
+        self._set_output(False, None, None, None)
+        if reset_kalman:
+            self.kalman.reset()
+
+    def _mark_target_seen(self):
+        """Call whenever a locked target is successfully found this frame."""
+        self._target_missing_since = None
+
+    def _mark_target_missing_and_check_lost(self):
+        """
+        Call when the locked target could not be found this frame.
+        Returns True once the grace period has elapsed (caller should then
+        transition to LOST); returns False while still within the grace
+        period (caller should leave the last known output untouched so the
+        servo holds position rather than snapping to "no target").
+        """
+        now = time.time()
+        if self._target_missing_since is None:
+            self._target_missing_since = now
+            return False
+
+        return (now - self._target_missing_since) >= self.LOST_GRACE_PERIOD_SEC
+
+    # -----------------------------------------------------------------
+    # Thread main loop
+    # -----------------------------------------------------------------
     def run(self):
         print(f"[AI] FSM thread started. Initial state: {self.current_state}")
+        self.logger.log("PIPELINE_STARTED", state=self.current_state)
 
         while self.running:
             ret, frame = self.camera_thread.get_frame()
@@ -114,17 +208,21 @@ class AIPipeline(threading.Thread):
                 time.sleep(0.01)
                 continue
 
+            step_start = time.time()
             try:
                 self._step(frame)
             except Exception as exc:
                 # Never let a single bad frame kill the whole AI thread.
                 print(f"[AI] Unexpected error during step, resetting to SEARCHING: {exc}")
+                self.logger.log("PIPELINE_ERROR", error=str(exc))
                 self.current_state = self.STATE_SEARCHING
-                self.has_target = False
-                self.raw_bbox = None
-                self.smoothed_bbox = None
-                self.target_center = None
-                self.kalman.reset()
+                self.tracker = None
+                self.locked_identity = None
+                self._target_missing_since = None
+                self._clear_target()
+
+            with self._lock:
+                self.last_step_latency_ms = (time.time() - step_start) * 1000.0
 
             time.sleep(0.01)
 
@@ -135,41 +233,41 @@ class AIPipeline(threading.Thread):
             self._step_tracking_face(frame)
         elif self.current_state == self.STATE_FALLBACK_PERSON:
             self._step_fallback_person(frame)
+        elif self.current_state == self.STATE_LOST:
+            self._step_lost(frame)
 
     # -----------------------------------------------------------------
     # State: SEARCHING
     # -----------------------------------------------------------------
     def _step_searching(self, frame):
         face_results = self.yolo_face(frame, verbose=False, device=self.device)
-        face_found = False
 
         for r in face_results:
-            if len(r.boxes) > 0:
-                box = r.boxes[0].xyxy[0].cpu().numpy().astype(int)
-                self.raw_bbox = list(box)
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                crop = _crop_safe(frame, xyxy)
+                name, score = self.recognizer.identify(crop)
+
+                if name is None:
+                    # Either nobody is registered, or this face doesn't match
+                    # anyone registered closely enough -- log once and move
+                    # on without locking onto a stranger.
+                    self.logger.log("FACE_IGNORED", score=f"{score:.2f}")
+                    continue
+
+                self.raw_bbox = list(xyxy)
+                self.locked_identity = name
                 self.current_state = self.STATE_TRACKING_FACE
+                self._target_missing_since = None
                 self._init_csrt_tracker(frame, self.raw_bbox)
-                face_found = True
-                print("[FSM] Face detected -> TRACKING_FACE (CSRT engaged)")
-                break
+                self.logger.log(
+                    "TARGET_ACQUIRED", name=name, score=f"{score:.2f}", mode="FACE_TRACK"
+                )
+                print(f"[FSM] Recognized '{name}' (score={score:.2f}) -> TRACKING_FACE")
+                return
 
-        if not face_found:
-            person_results = self.yolo_person(frame, verbose=False, device=self.device)
-            for r in person_results:
-                person_boxes = [b for b in r.boxes if int(b.cls[0]) == 0]
-                if len(person_boxes) > 0:
-                    box = person_boxes[0].xyxy[0].cpu().numpy().astype(int)
-                    self.raw_bbox = list(box)
-                    self.current_state = self.STATE_FALLBACK_PERSON
-                    self.kalman.reset()
-                    print("[FSM] No face but person detected -> FALLBACK_PERSON")
-                    break
-
-        if self.current_state == self.STATE_SEARCHING:
-            self.has_target = False
-            self.raw_bbox = None
-            self.smoothed_bbox = None
-            self.target_center = None
+        # No registered face found this frame.
+        self._clear_target(reset_kalman=False)
 
     # -----------------------------------------------------------------
     # State: TRACKING_FACE
@@ -180,35 +278,52 @@ class AIPipeline(threading.Thread):
         success, tracker_box = self.tracker.update(frame)
 
         if not success:
-            print("[FSM] CSRT lost the face.")
-            self.current_state = self.STATE_FALLBACK_PERSON
+            self._handle_face_track_failure(reason="CSRT lost the face")
             return
 
         tx, ty, tw, th = map(int, tracker_box)
-        self.smoothed_bbox = [tx, ty, tx + tw, ty + th]
+        smoothed_bbox = [tx, ty, tx + tw, ty + th]
 
         raw_cx, raw_cy = tx + tw // 2, ty + th // 2
         kx, ky = self.kalman.predict_and_correct(raw_cx, raw_cy)
 
-        self.has_target = True
-        self.target_center = (kx, ky)
+        self._mark_target_seen()
+        self._set_output(True, self.raw_bbox, smoothed_bbox, (kx, ky))
 
         if self.validate_counter >= self.VALIDATE_INTERVAL:
             self.validate_counter = 0
-            face_results = self.yolo_face(frame, verbose=False, device=self.device)
-            verified = False
+            self._revalidate_face_identity(frame)
 
-            for r in face_results:
-                if len(r.boxes) > 0:
-                    box = r.boxes[0].xyxy[0].cpu().numpy().astype(int)
-                    self.raw_bbox = list(box)
-                    self._init_csrt_tracker(frame, self.raw_bbox)
-                    verified = True
-                    break
+    def _revalidate_face_identity(self, frame):
+        """
+        Periodically re-run YOLO-face + recognition to correct CSRT drift and
+        confirm we're still tracking the same registered person (not someone
+        who has since walked into the CSRT box).
+        """
+        face_results = self.yolo_face(frame, verbose=False, device=self.device)
 
-            if not verified:
-                print("[FSM] CSRT drifted or user turned away (re-check found no face).")
-                self.current_state = self.STATE_FALLBACK_PERSON
+        for r in face_results:
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                crop = _crop_safe(frame, xyxy)
+                name, score = self.recognizer.identify(crop)
+
+                if name != self.locked_identity:
+                    continue
+
+                self.raw_bbox = list(xyxy)
+                self._init_csrt_tracker(frame, self.raw_bbox)
+                return
+
+        self._handle_face_track_failure(
+            reason="re-check found no face matching the locked identity"
+        )
+
+    def _handle_face_track_failure(self, reason):
+        print(f"[FSM] {reason} -> trying FALLBACK_PERSON")
+        self.logger.log("FACE_TRACK_LOST", reason=reason, name=self.locked_identity)
+        self.current_state = self.STATE_FALLBACK_PERSON
+        self.fallback_face_check_counter = 0
 
     # -----------------------------------------------------------------
     # State: FALLBACK_PERSON
@@ -218,53 +333,120 @@ class AIPipeline(threading.Thread):
         person_found = False
 
         for r in person_results:
-            person_boxes = [b for b in r.boxes if int(b.cls[0]) == 0]
+            person_boxes = [
+                b for b in r.boxes if self.yolo_person.names[int(b.cls[0])] == "person"
+            ]
             if len(person_boxes) == 0:
                 continue
 
             px1, py1, px2, py2 = person_boxes[0].xyxy[0].cpu().numpy().astype(int)
-            self.raw_bbox = [px1, py1, px2, py2]
-            self.smoothed_bbox = self.raw_bbox
+            raw_bbox = [px1, py1, px2, py2]
             person_found = True
 
             body_cx = px1 + (px2 - px1) // 2
             body_cy = py1 + (py2 - py1) // 4  # bias toward chest/head, not navel
 
             kx, ky = self.kalman.predict_and_correct(body_cx, body_cy)
-            self.has_target = True
-            self.target_center = (kx, ky)
+            self._mark_target_seen()
+            self._set_output(True, raw_bbox, raw_bbox, (kx, ky))
 
-            # Periodically re-check for a face within the person box, using a
-            # frame counter rather than wall-clock time for a deterministic
-            # 1-in-N check rate.
+            # Periodically re-check for the registered face within the
+            # person box, using a frame counter rather than wall-clock time
+            # for a deterministic 1-in-N check rate.
             self.fallback_face_check_counter += 1
             if self.fallback_face_check_counter >= self.FALLBACK_FACE_CHECK_INTERVAL:
                 self.fallback_face_check_counter = 0
-                face_results = self.yolo_face(frame, verbose=False, device=self.device)
-                for fr in face_results:
-                    if len(fr.boxes) > 0:
-                        fbox = fr.boxes[0].xyxy[0].cpu().numpy().astype(int)
-                        self.raw_bbox = list(fbox)
-                        self._init_csrt_tracker(frame, self.raw_bbox)
-                        self.current_state = self.STATE_TRACKING_FACE
-                        print("[FSM] Face reacquired -> TRACKING_FACE")
-                        break
+                if self._try_reacquire_face(frame):
+                    return
             break
 
         if not person_found:
-            print("[FSM] Lost target entirely -> SEARCHING")
-            self.current_state = self.STATE_SEARCHING
-            self.kalman.reset()
+            self._handle_target_missing(reason="lost person in FALLBACK_PERSON")
 
+    def _try_reacquire_face(self, frame):
+        """Look for the locked identity's face again; switch back to
+        TRACKING_FACE if found. Returns True if reacquired."""
+        face_results = self.yolo_face(frame, verbose=False, device=self.device)
+
+        for fr in face_results:
+            for box in fr.boxes:
+                fbox = box.xyxy[0].cpu().numpy().astype(int)
+                crop = _crop_safe(frame, fbox)
+                name, score = self.recognizer.identify(crop)
+
+                if name != self.locked_identity:
+                    continue
+
+                self.raw_bbox = list(fbox)
+                self._init_csrt_tracker(frame, self.raw_bbox)
+                self.current_state = self.STATE_TRACKING_FACE
+                self.logger.log("FACE_REACQUIRED", name=name, score=f"{score:.2f}")
+                print(f"[FSM] Face reacquired for '{name}' -> TRACKING_FACE")
+                return True
+
+        return False
+
+    # -----------------------------------------------------------------
+    # State: LOST
+    # -----------------------------------------------------------------
+    def _step_lost(self, frame):
+        """
+        Target has been missing longer than the grace period. Servo holds
+        its last commanded position (has_target=False tells ServoController
+        not to move). Keep scanning for the registered face so we can
+        recover automatically without operator intervention.
+        """
+        if self._try_reacquire_face(frame):
+            self._mark_target_seen()
+            self.logger.log("TARGET_REACQUIRED", name=self.locked_identity)
+            return
+
+        # Stay in LOST; output already reflects "no target" (set in
+        # _handle_target_missing right before transitioning here).
+
+    # -----------------------------------------------------------------
+    # Shared "target missing" handling with debounce
+    # -----------------------------------------------------------------
+    def _handle_target_missing(self, reason):
+        should_declare_lost = self._mark_target_missing_and_check_lost()
+
+        if not should_declare_lost:
+            # Still within the grace period: don't touch has_target/target
+            # output -- the dashboard/servo simply keep using the last
+            # known position for a moment, instead of snapping to "no
+            # target" on a single dropped frame.
+            return
+
+        print(f"[FSM] {reason}, grace period elapsed -> LOST")
+        self.logger.log("TARGET_LOST", name=self.locked_identity, reason=reason)
+        self.current_state = self.STATE_LOST
+        self.tracker = None
+        self._clear_target(reset_kalman=True)
+
+    # -----------------------------------------------------------------
+    # Public accessors
+    # -----------------------------------------------------------------
     def get_ai_result(self):
         """Return (has_target, raw_bbox, smoothed_bbox, target_center, state)."""
-        return (
-            self.has_target,
-            self.raw_bbox,
-            self.smoothed_bbox,
-            self.target_center,
-            self.current_state,
-        )
+        with self._lock:
+            return (
+                self.has_target,
+                self.raw_bbox,
+                self.smoothed_bbox,
+                self.target_center,
+                self.current_state,
+            )
+
+    def get_locked_identity(self):
+        return self.locked_identity
+
+    def get_last_latency_ms(self):
+        with self._lock:
+            return self.last_step_latency_ms
+
+    def reload_face_database(self):
+        """Call this if a new person is registered while operation is running."""
+        self.recognizer.load_database()
 
     def stop(self):
         self.running = False
