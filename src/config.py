@@ -68,11 +68,33 @@ FACE_DB_DIR = os.path.join(DATA_DIR, "face_db")
 PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
 
 # ---------------------------------------------------------------------------
-# Camera (ESP32-S3-CAM MJPEG stream)
+# Cameras (ESP32-CAM MJPEG streams)
 # ---------------------------------------------------------------------------
-# Change to "http://192.168.0.10/stream" or "http://192.168.0.10:81/stream"
-# depending on your firmware.
-CAMERA_URL = "http://192.168.0.10/stream"
+# Each ESP32-CAM streams MJPEG directly to this machine (no longer routed
+# through the ESP32-S3, which now only acts as a coordination gateway over
+# HTTP/MQTT to tell each ESP32-CAM when to stream/snapshot/sleep).
+#
+# "has_servo": True marks the single camera that the pan/tilt servo rig is
+# physically mounted on. Exactly one camera should have this set to True;
+# the others are detection-only (no physical servo attached).
+CAMERAS = [
+    {
+        "id": "cam1",
+        "room_name": "Phong 1",
+        "url": "http://192.168.0.10/stream",
+        "has_servo": True,
+    },
+    {
+        "id": "cam2",
+        "room_name": "Phong 2",
+        "url": "http://192.168.0.11/stream",
+        "has_servo": False,
+    },
+]
+
+# Kept for backward compatibility with any code (e.g. registration app)
+# that still imports a single CAMERA_URL directly.
+CAMERA_URL = CAMERAS[0]["url"]
 
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240

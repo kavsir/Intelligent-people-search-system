@@ -76,18 +76,23 @@ def _crop_safe(frame, bbox):
 
 
 class AIPipeline(threading.Thread):
-    def __init__(self, camera_thread, event_logger=None):
+    def __init__(self, camera_thread, event_logger=None, room_name="camera"):
         super().__init__()
         self.camera_thread = camera_thread
         self.running = True
         self.daemon = True
+
+        # Used to tag every log line / print statement so that, when several
+        # AIPipeline instances run in parallel (one per physical camera /
+        # room), it's clear which camera a given event came from.
+        self.room_name = room_name
 
         self.logger = event_logger or EventLogger()
 
         # --- Load models ---
         print("[AI] Loading AI models...")
         self.device = config.get_torch_device()
-        print(f"[AI] YOLO models running on {self.device.upper()}.")
+        print(f"[AI:{self.room_name}] YOLO models running on {self.device.upper()}.")
 
         self.yolo_person = YOLO(config.YOLO_PERSON_MODEL_PATH)
         try:
@@ -199,8 +204,8 @@ class AIPipeline(threading.Thread):
     # Thread main loop
     # -----------------------------------------------------------------
     def run(self):
-        print(f"[AI] FSM thread started. Initial state: {self.current_state}")
-        self.logger.log("PIPELINE_STARTED", state=self.current_state)
+        print(f"[AI:{self.room_name}] FSM thread started. Initial state: {self.current_state}")
+        self.logger.log("PIPELINE_STARTED", state=self.current_state, room=self.room_name)
 
         while self.running:
             ret, frame = self.camera_thread.get_frame()
@@ -213,8 +218,8 @@ class AIPipeline(threading.Thread):
                 self._step(frame)
             except Exception as exc:
                 # Never let a single bad frame kill the whole AI thread.
-                print(f"[AI] Unexpected error during step, resetting to SEARCHING: {exc}")
-                self.logger.log("PIPELINE_ERROR", error=str(exc))
+                print(f"[AI:{self.room_name}] Unexpected error during step, resetting to SEARCHING: {exc}")
+                self.logger.log("PIPELINE_ERROR", error=str(exc), room=self.room_name)
                 self.current_state = self.STATE_SEARCHING
                 self.tracker = None
                 self.locked_identity = None
@@ -252,7 +257,7 @@ class AIPipeline(threading.Thread):
                     # Either nobody is registered, or this face doesn't match
                     # anyone registered closely enough -- log once and move
                     # on without locking onto a stranger.
-                    self.logger.log("FACE_IGNORED", score=f"{score:.2f}")
+                    self.logger.log("FACE_IGNORED", score=f"{score:.2f}", room=self.room_name)
                     continue
 
                 self.raw_bbox = list(xyxy)
@@ -261,9 +266,9 @@ class AIPipeline(threading.Thread):
                 self._target_missing_since = None
                 self._init_csrt_tracker(frame, self.raw_bbox)
                 self.logger.log(
-                    "TARGET_ACQUIRED", name=name, score=f"{score:.2f}", mode="FACE_TRACK"
+                    "TARGET_ACQUIRED", name=name, score=f"{score:.2f}", mode="FACE_TRACK", room=self.room_name
                 )
-                print(f"[FSM] Recognized '{name}' (score={score:.2f}) -> TRACKING_FACE")
+                print(f"[FSM:{self.room_name}] Recognized '{name}' (score={score:.2f}) -> TRACKING_FACE")
                 return
 
         # No registered face found this frame.
@@ -320,8 +325,8 @@ class AIPipeline(threading.Thread):
         )
 
     def _handle_face_track_failure(self, reason):
-        print(f"[FSM] {reason} -> trying FALLBACK_PERSON")
-        self.logger.log("FACE_TRACK_LOST", reason=reason, name=self.locked_identity)
+        print(f"[FSM:{self.room_name}] {reason} -> trying FALLBACK_PERSON")
+        self.logger.log("FACE_TRACK_LOST", reason=reason, name=self.locked_identity, room=self.room_name)
         self.current_state = self.STATE_FALLBACK_PERSON
         self.fallback_face_check_counter = 0
 
@@ -380,8 +385,8 @@ class AIPipeline(threading.Thread):
                 self.raw_bbox = list(fbox)
                 self._init_csrt_tracker(frame, self.raw_bbox)
                 self.current_state = self.STATE_TRACKING_FACE
-                self.logger.log("FACE_REACQUIRED", name=name, score=f"{score:.2f}")
-                print(f"[FSM] Face reacquired for '{name}' -> TRACKING_FACE")
+                self.logger.log("FACE_REACQUIRED", name=name, score=f"{score:.2f}", room=self.room_name)
+                print(f"[FSM:{self.room_name}] Face reacquired for '{name}' -> TRACKING_FACE")
                 return True
 
         return False
@@ -398,7 +403,7 @@ class AIPipeline(threading.Thread):
         """
         if self._try_reacquire_face(frame):
             self._mark_target_seen()
-            self.logger.log("TARGET_REACQUIRED", name=self.locked_identity)
+            self.logger.log("TARGET_REACQUIRED", name=self.locked_identity, room=self.room_name)
             return
 
         # Stay in LOST; output already reflects "no target" (set in
@@ -417,8 +422,8 @@ class AIPipeline(threading.Thread):
             # target" on a single dropped frame.
             return
 
-        print(f"[FSM] {reason}, grace period elapsed -> LOST")
-        self.logger.log("TARGET_LOST", name=self.locked_identity, reason=reason)
+        print(f"[FSM:{self.room_name}] {reason}, grace period elapsed -> LOST")
+        self.logger.log("TARGET_LOST", name=self.locked_identity, reason=reason, room=self.room_name)
         self.current_state = self.STATE_LOST
         self.tracker = None
         self._clear_target(reset_kalman=True)
@@ -439,6 +444,9 @@ class AIPipeline(threading.Thread):
 
     def get_locked_identity(self):
         return self.locked_identity
+
+    def get_room_name(self):
+        return self.room_name
 
     def get_last_latency_ms(self):
         with self._lock:

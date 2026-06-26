@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIoT Operation Dashboard</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background: #14161a;
+            color: #e6e6e6;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 { text-align: center; margin-bottom: 6px; }
+        .subtitle { text-align: center; color: #888; margin-bottom: 24px; font-size: 14px; }
+
+        .container { max-width: 1200px; margin: 0 auto; }
+
+        .cameras {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            justify-content: center;
+            margin-bottom: 28px;
+        }
+        .camera-card {
+            background: #1f2228;
+            border-radius: 10px;
+            padding: 10px;
+            box-shadow: 0 0 12px rgba(0,0,0,0.4);
+            flex: 1 1 380px;
+            max-width: 480px;
+        }
+        .camera-card h3 {
+            margin: 0 0 8px 4px;
+            font-size: 15px;
+            color: #ddd;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .servo-badge {
+            font-size: 11px;
+            background: #2c5cff33;
+            color: #6e9bff;
+            border-radius: 4px;
+            padding: 2px 6px;
+        }
+        .camera-card img {
+            width: 100%;
+            border-radius: 6px;
+            background: #000;
+            display: block;
+            aspect-ratio: 4 / 3;
+            object-fit: contain;
+        }
+
+        .map-section {
+            text-align: center;
+        }
+        .map-section h2 {
+            font-size: 16px;
+            color: #ccc;
+            margin-bottom: 12px;
+        }
+        .floor-map {
+            display: flex;
+            justify-content: center;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+        .room-cell {
+            width: 150px;
+            height: 150px;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            border: 2px solid #555;
+            background: #3a3a3a;
+            transition: background 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+        }
+        .room-cell.alert {
+            background: #b71c1c;
+            border-color: #ff5252;
+            box-shadow: 0 0 18px rgba(255, 0, 0, 0.55);
+        }
+        .room-cell .room-name { font-size: 15px; margin-bottom: 6px; }
+        .room-cell .room-state { font-size: 12px; opacity: 0.85; font-weight: normal; }
+        .room-cell .room-identity { font-size: 12px; margin-top: 4px; opacity: 0.95; }
+
+        .status-line {
+            text-align: center;
+            color: #777;
+            font-size: 12px;
+            margin-top: 18px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏠 AIoT Multi-Camera Operation Dashboard</h1>
+        <div class="subtitle">Theo dõi thời gian thực &middot; nhấn Ctrl+C trong terminal để dừng hệ thống</div>
+
+        <div class="cameras">
+            {% for room in rooms %}
+            <div class="camera-card">
+                <h3>
+                    {{ room.room_name }}
+                    {% if room.has_servo %}<span class="servo-badge">SERVO</span>{% endif %}
+                </h3>
+                <img src="/video_feed/{{ room.id }}" alt="{{ room.room_name }} feed">
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="map-section">
+            <h2>Sơ đồ tầng (Top-Down)</h2>
+            <div class="floor-map" id="floor-map">
+                {% for room in rooms %}
+                <div class="room-cell" id="room-{{ room.id }}">
+                    <div class="room-name">{{ room.room_name }}</div>
+                    <div class="room-state" id="state-{{ room.id }}">--</div>
+                    <div class="room-identity" id="identity-{{ room.id }}"></div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="status-line" id="status-line">Đang kết nối...</div>
+    </div>
+
+    <script>
+        async function pollStatus() {
+            try {
+                const res = await fetch('/api/room_status');
+                const data = await res.json();
+                document.getElementById('status-line').textContent =
+                    'Cập nhật lần cuối: ' + new Date().toLocaleTimeString();
+
+                data.rooms.forEach(room => {
+                    const cell = document.getElementById('room-' + room.id);
+                    const stateEl = document.getElementById('state-' + room.id);
+                    const identityEl = document.getElementById('identity-' + room.id);
+                    if (!cell) return;
+
+                    cell.classList.toggle('alert', room.has_target);
+                    stateEl.textContent = room.state || '--';
+                    identityEl.textContent = room.identity ? ('👤 ' + room.identity) : '';
+                });
+            } catch (err) {
+                document.getElementById('status-line').textContent =
+                    'Mất kết nối tới server: ' + err.message;
+            }
+        }
+
+        pollStatus();
+        setInterval(pollStatus, 500);
+    </script>
+</body>
+</html>
