@@ -1,6 +1,6 @@
 """
 Shared configuration for both the registration (Flask) app and the
-operation (camera + AI + servo) app.
+operation (camera + AI recognition) app.
 """
 
 import os
@@ -74,21 +74,19 @@ PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
 # through the ESP32-S3, which now only acts as a coordination gateway over
 # HTTP/MQTT to tell each ESP32-CAM when to stream/snapshot/sleep).
 #
-# "has_servo": True marks the single camera that the pan/tilt servo rig is
-# physically mounted on. Exactly one camera should have this set to True;
-# the others are detection-only (no physical servo attached).
+# Cameras are fixed-position (no pan/tilt servo). Each one only detects and
+# recognizes whoever is in its own room; there is no mechanism that moves
+# the camera to follow a person.
 CAMERAS = [
     {
         "id": "cam1",
         "room_name": "Phong 1",
         "url": "http://192.168.0.10/stream",
-        "has_servo": True,
     },
     {
         "id": "cam2",
         "room_name": "Phong 2",
         "url": "http://192.168.0.11/stream",
-        "has_servo": False,
     },
 ]
 
@@ -129,20 +127,57 @@ IDENTITY_RECHECK_INTERVAL = 10
 # ---------------------------------------------------------------------------
 # Seconds of consecutive "no target" frames tolerated before the FSM
 # actually declares the target lost. Prevents 1-2 frame detection hiccups
-# from flapping the state (and the servo) back and forth.
+# from flapping the state back and forth.
 LOST_GRACE_PERIOD_SEC = 1.0
 
 # ---------------------------------------------------------------------------
-# Servo / serial
+# Floor plan & inferred presence
 # ---------------------------------------------------------------------------
-SERVO_PORT = "COM5"          # e.g. "COM5" on Windows, "/dev/ttyUSB0" on Linux
-SERVO_BAUDRATE = 115200
+# How long (seconds) a "inferred presence" highlight stays on a no-cam room
+# before being automatically cleared if no camera confirms the target.
+# Can also be cleared manually via the dashboard Reset button.
+# Set to 0 to disable auto-clear (keep until cam sees target again).
+INFERRED_PRESENCE_TIMEOUT_SEC = 60
 
-# Ignore target offsets smaller than this many pixels (keeps the servo from
-# hunting/jittering when the target is already close enough to center).
-SERVO_DEADZONE_PX = 15
-
-# Maximum degrees the pan/tilt angle is allowed to change in a single
-# control step, regardless of what the PID output says. Prevents sudden
-# jerky motion, e.g. right after switching tracking targets.
-SERVO_MAX_DEGREE_STEP = 3.0
+# Floor plan room definitions.
+# Each room has:
+#   id         – must match a CAMERAS[*]["id"] if the room has a camera,
+#                or any unique string for cam-less rooms.
+#   name       – display label on the floor map.
+#   cam_id     – set to the matching camera id if this room has a cam,
+#                or None for cam-less rooms.
+#   neighbors  – list of room ids directly reachable from this room.
+#                Used by the inference engine to decide which no-cam rooms
+#                to highlight when a target disappears from a cam room.
+FLOOR_PLAN = [
+    {
+        "id": "p1",
+        "name": "Phòng 1",
+        "cam_id": "cam1",
+        "neighbors": ["p2"],
+    },
+    {
+        "id": "p2",
+        "name": "Phòng 2",
+        "cam_id": "cam2",
+        "neighbors": ["p1", "p3", "p4", "p5"],
+    },
+    {
+        "id": "p3",
+        "name": "Phòng 3",
+        "cam_id": None,
+        "neighbors": ["p2"],
+    },
+    {
+        "id": "p4",
+        "name": "Phòng 4",
+        "cam_id": None,
+        "neighbors": ["p2"],
+    },
+    {
+        "id": "p5",
+        "name": "Phòng 5",
+        "cam_id": None,
+        "neighbors": ["p2"],
+    },
+]

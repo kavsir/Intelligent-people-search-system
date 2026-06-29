@@ -1,10 +1,9 @@
 """
 Structured event logging shared across the operation pipeline.
 
-The assignment explicitly requires logging events such as "target detected",
-"target lost", and "servo angle updated" (see Bao_Cao_Dinh_Huong, section 3
-and 7.4). This module gives every component (AI pipeline, servo controller,
-dashboard) a single, thread-safe place to:
+Logs structured events such as "target detected" and "target lost" for the
+technical report / experiment results. This module gives every component
+(AI pipeline, dashboard) a single, thread-safe place to:
 
   1. Write structured event rows to a CSV log file on disk (for the
      technical report / experiment results).

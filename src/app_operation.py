@@ -1,10 +1,13 @@
 """
-Operation entry point: runs one camera reader + AI tracking pipeline per
-physical ESP32-CAM (one per room, see config.CAMERAS), plus a single servo
-controller attached to whichever camera has has_servo=True. Displays a
-live debug dashboard with all camera feeds side-by-side and a simple 2D
-top-down floor map that lights up red for whichever room currently has a
-detected target.
+Operation entry point: runs one camera reader + AI recognition pipeline per
+physical ESP32-CAM (one per room, see config.CAMERAS). Displays a live
+debug dashboard with all camera feeds side-by-side and a simple 2D top-down
+floor map that lights up red for whichever room currently has a detected
+target.
+
+Cameras are fixed-position -- there is no pan/tilt servo. Each room's
+pipeline only detects and recognizes whoever is in its own frame; nothing
+moves the camera to follow a person.
 
 Architecture note: each ESP32-CAM streams MJPEG directly to this machine.
 The ESP32-S3 is a separate coordination gateway (HTTP/MQTT) that tells each
@@ -26,7 +29,6 @@ import config
 from operation.ai_pipeline import AIPipeline
 from operation.camera_reader import CameraReader
 from operation.event_logger import EventLogger
-from operation.servo_controller import ServoController
 
 
 # ---------------------------------------------------------------------------
@@ -38,22 +40,11 @@ class RoomUnit:
     def __init__(self, cam_config, shared_logger):
         self.id = cam_config["id"]
         self.room_name = cam_config["room_name"]
-        self.has_servo = cam_config.get("has_servo", False)
 
         self.camera_thread = CameraReader(url=cam_config["url"], name=self.room_name)
         self.ai_thread = AIPipeline(
             self.camera_thread, event_logger=shared_logger, room_name=self.room_name
         )
-
-        self.servo_thread = None
-        if self.has_servo:
-            self.servo_thread = ServoController(
-                self.ai_thread,
-                port=config.SERVO_PORT,
-                baudrate=config.SERVO_BAUDRATE,
-                frame_size=(config.FRAME_WIDTH, config.FRAME_HEIGHT),
-                event_logger=shared_logger,
-            )
 
         # Per-room FPS counter state (each camera can run at a slightly
         # different real FPS, so these are tracked independently).
@@ -64,18 +55,12 @@ class RoomUnit:
     def start(self):
         self.camera_thread.start()
         self.ai_thread.start()
-        if self.servo_thread:
-            self.servo_thread.start()
 
     def stop(self):
-        if self.servo_thread:
-            self.servo_thread.stop()
         self.ai_thread.stop()
         self.camera_thread.stop()
 
     def join(self):
-        if self.servo_thread:
-            self.servo_thread.join()
         self.ai_thread.join()
         self.camera_thread.join()
 
@@ -86,6 +71,31 @@ class RoomUnit:
             self._fps_counter = 0
             self._fps_start_time = time.time()
         return self._fps_text
+
+
+# ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+def validate_camera_config(cameras):
+    """Catch config mistakes before any thread is started."""
+    errors = []
+
+    ids = [c["id"] for c in cameras]
+    if len(ids) != len(set(ids)):
+        errors.append(f"Duplicate camera 'id' values in config.CAMERAS: {ids}")
+
+    urls = [c["url"] for c in cameras]
+    if len(urls) != len(set(urls)):
+        errors.append(
+            f"Duplicate camera 'url' values in config.CAMERAS: {urls} -- "
+            "two rooms are pointing at the same stream."
+        )
+
+    if errors:
+        print("\n[CONFIG ERROR] Refusing to start -- fix config.CAMERAS first:")
+        for err in errors:
+            print(f"  - {err}")
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -104,9 +114,9 @@ def draw_event_feed(frame, events, origin=(10, 90), line_height=16, max_lines=6)
 
 def render_room_panel(frame, room, fps_text):
     """
-    Draw every overlay (crosshair, bbox, FPS, latency, (u,v), servo angles,
-    state) onto one room's frame in place, and return whether that room
-    currently has a detected target (used by the top-down map).
+    Draw every overlay (crosshair, bbox, FPS, latency, (u,v), state) onto
+    one room's frame in place, and return whether that room currently has
+    a detected target (used by the top-down map).
     """
     h, w, _ = frame.shape
     cx, cy = w // 2, h // 2
@@ -117,19 +127,14 @@ def render_room_panel(frame, room, fps_text):
     latency_ms = room.ai_thread.get_last_latency_ms()
     identity = room.ai_thread.get_locked_identity()
 
-    if room.servo_thread:
-        current_pan, current_tilt = room.servo_thread.get_current_angles()
-    else:
-        current_pan, current_tilt = None, None
-
     # Room label at the very top so it's obvious which feed is which once
     # frames are tiled side-by-side.
     cv2.putText(
         frame, room.room_name, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
     )
 
-    # Crosshair at the center of the frame (the point the servo aims for,
-    # if this room has one; otherwise just a visual reference point).
+    # Crosshair at the center of the frame -- purely a visual reference
+    # point now (no servo aims at it; the camera is fixed).
     cv2.line(frame, (cx - 10, cy), (cx + 10, cy), (255, 255, 255), 1)
     cv2.line(frame, (cx, cy - 10), (cx, cy + 10), (255, 255, 255), 1)
 
@@ -177,7 +182,7 @@ def render_room_panel(frame, room, fps_text):
             2,
         )
 
-    # --- Overlay info: FPS, latency, (u, v), servo angles (if any) ---
+    # --- Overlay info: FPS, latency, (u, v) ---
     cv2.putText(frame, fps_text, (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
     cv2.putText(
         frame,
@@ -191,24 +196,8 @@ def render_room_panel(frame, room, fps_text):
 
     uv_text = f"(u,v)=({target_center[0]},{target_center[1]})" if target_center else "(u,v)=N/A"
     cv2.putText(
-        frame, uv_text, (10, h - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
+        frame, uv_text, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
     )
-
-    if room.has_servo:
-        cv2.putText(
-            frame,
-            f"Servo Pan: {current_pan} | Tilt: {current_tilt}",
-            (10, h - 15),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1,
-        )
-    else:
-        cv2.putText(
-            frame, "No servo (detection only)", (10, h - 15),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1,
-        )
 
     return has_target
 
@@ -276,8 +265,13 @@ def tile_horizontally(frames):
 # ---------------------------------------------------------------------------
 def main():
     # -----------------------------------------------------------------
-    # 1. Start background threads: one RoomUnit (camera + AI [+ servo])
-    #    per entry in config.CAMERAS.
+    # 0. Validate config BEFORE starting any thread.
+    # -----------------------------------------------------------------
+    validate_camera_config(config.CAMERAS)
+
+    # -----------------------------------------------------------------
+    # 1. Start background threads: one RoomUnit (camera + AI) per entry
+    #    in config.CAMERAS.
     # -----------------------------------------------------------------
     shared_logger = EventLogger()
 
@@ -286,11 +280,8 @@ def main():
     for room in rooms:
         room.start()
 
-    servo_rooms = [r.room_name for r in rooms if r.has_servo]
-
-    print("\n--- OPERATION SYSTEM RUNNING (multi-camera) ---")
+    print("\n--- OPERATION SYSTEM RUNNING (multi-camera, fixed cameras) ---")
     print(f"Rooms: {[r.room_name for r in rooms]}")
-    print(f"Servo attached to: {servo_rooms or 'NONE'}")
     print(f"Target FPS: {config.TARGET_FPS}")
     print(f"Event log: {shared_logger.log_path}")
     print("Press 'q' on the dashboard window to stop safely.\n")
@@ -331,7 +322,7 @@ def main():
 
         if panels:
             combined = tile_horizontally(panels)
-            cv2.imshow("AIoT Multi-Camera Pan-Tilt Control Dashboard", combined)
+            cv2.imshow("AIoT Multi-Camera Recognition Dashboard", combined)
 
             topdown = draw_topdown_map(room_has_target, [r.room_name for r in rooms])
             cv2.imshow("Floor Map (Top-Down)", topdown)
@@ -348,7 +339,7 @@ def main():
     # -----------------------------------------------------------------
     # 3. Clean shutdown
     # -----------------------------------------------------------------
-    print("[Main] Stopping all camera/AI/servo threads...")
+    print("[Main] Stopping all camera/AI threads...")
     for room in rooms:
         room.stop()
     for room in rooms:

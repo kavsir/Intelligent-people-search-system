@@ -14,7 +14,8 @@ States:
     TRACKING_FACE   -> locked onto a registered face, tracked via CSRT
     FALLBACK_PERSON -> face lost, tracking the same person's body instead
     LOST            -> target missing for longer than the grace period;
-                       servo holds its last position (see ServoController)
+                       last known bbox/center is simply discarded (cameras
+                       are fixed-position, so nothing needs to "hold")
 
 IGNORE is not a separate FSM state here -- it's simply what happens when a
 detected face does not match anyone in face_db: it's logged but ignored,
@@ -145,8 +146,8 @@ class AIPipeline(threading.Thread):
         self.LOST_GRACE_PERIOD_SEC = config.LOST_GRACE_PERIOD_SEC
         self._target_missing_since = None
 
-        # --- Output state (protected by _lock since the servo/dashboard
-        # threads read it concurrently with this thread writing it) ---
+        # --- Output state (protected by _lock since the dashboard thread(s)
+        # read it concurrently with this thread writing it) ---
         self._lock = threading.Lock()
         self.has_target = False
         self.raw_bbox = None
@@ -191,7 +192,7 @@ class AIPipeline(threading.Thread):
         Returns True once the grace period has elapsed (caller should then
         transition to LOST); returns False while still within the grace
         period (caller should leave the last known output untouched so the
-        servo holds position rather than snapping to "no target").
+        dashboard doesn't flicker the bbox off for a 1-2 frame hiccup).
         """
         now = time.time()
         if self._target_missing_since is None:
@@ -396,10 +397,10 @@ class AIPipeline(threading.Thread):
     # -----------------------------------------------------------------
     def _step_lost(self, frame):
         """
-        Target has been missing longer than the grace period. Servo holds
-        its last commanded position (has_target=False tells ServoController
-        not to move). Keep scanning for the registered face so we can
-        recover automatically without operator intervention.
+        Target has been missing longer than the grace period. has_target
+        is now False, so the dashboard simply shows no bbox/center. Keep
+        scanning for the registered face so we can recover automatically
+        without operator intervention.
         """
         if self._try_reacquire_face(frame):
             self._mark_target_seen()
@@ -417,9 +418,9 @@ class AIPipeline(threading.Thread):
 
         if not should_declare_lost:
             # Still within the grace period: don't touch has_target/target
-            # output -- the dashboard/servo simply keep using the last
-            # known position for a moment, instead of snapping to "no
-            # target" on a single dropped frame.
+            # output -- the dashboard simply keeps showing the last known
+            # position for a moment, instead of snapping to "no target" on
+            # a single dropped frame.
             return
 
         print(f"[FSM:{self.room_name}] {reason}, grace period elapsed -> LOST")
