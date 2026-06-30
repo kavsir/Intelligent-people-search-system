@@ -17,4 +17,7 @@ huggingface_hub
 
 onnxruntime==1.20.1
 
---extra-index-url https://download.pytorch.org/whl/cu128
+flask-socketio 
+eventlet
+
+#--extra-index-url https://download.pytorch.org/whl/cu128

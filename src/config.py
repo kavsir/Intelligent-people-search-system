@@ -81,12 +81,12 @@ CAMERAS = [
     {
         "id": "cam1",
         "room_name": "Phong 1",
-        "url": "http://192.168.0.10/stream",
+        "url": "http://10.48.170.178/stream",
     },
     {
         "id": "cam2",
         "room_name": "Phong 2",
-        "url": "http://192.168.0.11/stream",
+        "url": "http://10.48.170.227/stream",
     },
 ]
 
@@ -114,7 +114,7 @@ AI_CONF_THRESHOLD = 0.5
 # detected face to be considered a match for a registered person. Lower this
 # (e.g. 0.4) if recognition feels too strict; raise it if strangers are
 # getting matched to a registered name.
-FACE_RECOGNITION_THRESHOLD = 0.5
+FACE_RECOGNITION_THRESHOLD = 0.35
 
 # How many AI-pipeline steps to wait between identity re-checks while a face
 # is already locked and tracked by CSRT. Identity doesn't need to be
@@ -129,6 +129,32 @@ IDENTITY_RECHECK_INTERVAL = 10
 # actually declares the target lost. Prevents 1-2 frame detection hiccups
 # from flapping the state back and forth.
 LOST_GRACE_PERIOD_SEC = 1.0
+
+# ---------------------------------------------------------------------------
+# CPU load / latency tuning
+# ---------------------------------------------------------------------------
+# Running multiple AIPipeline threads (one per camera) on CPU means they
+# compete for the same cores -- YOLO-face/YOLO-person/InsightFace are all
+# heavy enough that running 2+ at once noticeably slows each one down.
+# These knobs reduce wasted CPU time without changing input resolution or
+# detection accuracy.
+
+# In SEARCHING, how many pipeline steps to skip between YOLO-face calls.
+# 0 = run every step (old behavior). 2 means: run on step 0, skip steps 1
+# and 2, run again on step 3, etc. -- roughly a 1/3 reduction in CPU spent
+# on face detection while still scanning often enough that a newly-arrived
+# registered person is found within a fraction of a second, not noticeably
+# slower from a user's point of view.
+SEARCHING_SKIP_FRAMES = 2
+
+# Fixed delay (seconds) at the end of every pipeline step, applied only
+# when the step itself was fast. If a step already took a while (because
+# the CPU was busy with the other camera's thread), this sleep is skipped
+# entirely instead of stacking on top of an already-slow frame. This
+# replaces a flat time.sleep(0.01) that fired unconditionally even when
+# the CPU had no time to spare.
+STEP_SLEEP_SEC = 0.01
+STEP_SLEEP_SKIP_IF_STEP_TOOK_LONGER_THAN_SEC = 0.03
 
 # ---------------------------------------------------------------------------
 # Floor plan & inferred presence

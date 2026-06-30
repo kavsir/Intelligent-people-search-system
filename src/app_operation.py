@@ -114,40 +114,54 @@ def draw_event_feed(frame, events, origin=(10, 90), line_height=16, max_lines=6)
 
 def render_room_panel(frame, room, fps_text):
     """
-    Draw every overlay (crosshair, bbox, FPS, latency, (u,v), state) onto
-    one room's frame in place, and return whether that room currently has
-    a detected target (used by the top-down map).
+    Draw overlays: crosshair, bbox for ALL registered faces (yellow),
+    and a thicker bbox for the main target (green/red).
     """
     h, w, _ = frame.shape
     cx, cy = w // 2, h // 2
 
+    # Lấy thông tin mục tiêu chính
     has_target, raw_bbox, smoothed_bbox, target_center, current_state = (
         room.ai_thread.get_ai_result()
     )
+    # Lấy danh sách tất cả khuôn mặt đã đăng ký
+    all_faces = room.ai_thread.get_all_faces()
+
     latency_ms = room.ai_thread.get_last_latency_ms()
     identity = room.ai_thread.get_locked_identity()
 
-    # Room label at the very top so it's obvious which feed is which once
-    # frames are tiled side-by-side.
+    # Vẽ tên phòng
     cv2.putText(
         frame, room.room_name, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
     )
 
-    # Crosshair at the center of the frame -- purely a visual reference
-    # point now (no servo aims at it; the camera is fixed).
+    # Crosshair
     cv2.line(frame, (cx - 10, cy), (cx + 10, cy), (255, 255, 255), 1)
     cv2.line(frame, (cx, cy - 10), (cx, cy + 10), (255, 255, 255), 1)
 
+    # ===== Vẽ TẤT CẢ các khuôn mặt đã đăng ký (trừ target chính) =====
+    for face in all_faces:
+        name = face["name"]
+        bbox = face["bbox"]  # [x1,y1,x2,y2]
+        score = face["score"]
+        # Nếu là target chính, bỏ qua vì sẽ vẽ đậm sau
+        if name == identity and has_target:
+            continue
+        cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 255), 1)
+        label = f"{name} ({score:.2f})"
+        cv2.putText(
+            frame, label, (bbox[0], bbox[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1
+        )
+
+    # ===== Vẽ mục tiêu chính (nổi bật) =====
     if has_target:
-        if current_state == "TRACKING_FACE":
+        if current_state == "TRACKING":
             status_color = (0, 255, 0)  # green
-            status_text = f"STATE: FACE_TRACK ({identity or '?'})"
-        elif current_state == "FALLBACK_PERSON":
-            status_color = (0, 165, 255)  # orange
-            status_text = f"STATE: PERSON_TRACK ({identity or '?'})"
+            status_text = f"TRACKING ({identity or '?'})"
         else:
-            status_color = (0, 255, 255)  # yellow
-            status_text = f"STATE: {current_state}"
+            status_color = (0, 165, 255)  # orange
+            status_text = f"{current_state}"
 
         if raw_bbox:
             rx1, ry1, rx2, ry2 = raw_bbox
@@ -155,7 +169,7 @@ def render_room_panel(frame, room, fps_text):
 
         if smoothed_bbox:
             sx1, sy1, sx2, sy2 = smoothed_bbox
-            cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), status_color, 2)
+            cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), status_color, 3)
             cv2.putText(
                 frame,
                 status_text,

@@ -167,7 +167,7 @@ def start_system():
     for room in rooms:
         room.start()
         _room_has_target[room.id] = False
-
+    
     floor_plan = getattr(config, "FLOOR_PLAN", [])
     timeout = getattr(config, "INFERRED_PRESENCE_TIMEOUT_SEC", 60)
     inference_engine = InferenceEngine(floor_plan, timeout)
