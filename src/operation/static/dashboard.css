@@ -1,0 +1,322 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #22263a;
+  --border: #2e3250;
+  --text: #e2e8f0;
+  --muted: #64748b;
+  --green: #22c55e;
+  --orange: #f97316;
+  --red: #ef4444;
+  --yellow: #eab308;
+  --blue: #3b82f6;
+  --purple: #a855f7;
+}
+
+body {
+  font-family: 'Segoe UI', Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding: 16px;
+}
+
+/* ── Header ── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.header h1 { font-size: 18px; font-weight: 700; color: var(--text); }
+.header .subtitle { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.header-right { display: flex; align-items: center; gap: 10px; }
+.btn {
+  padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text); font-size: 12px;
+  cursor: pointer; transition: all .2s;
+}
+.btn:hover { background: var(--border); }
+.btn-danger { border-color: var(--red); color: var(--red); }
+.btn-danger:hover { background: rgba(239,68,68,.15); }
+#clock { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* ── Main grid ── */
+.main-grid {
+  display: grid;
+  grid-template-columns: 1fr 340px;
+  gap: 16px;
+}
+@media (max-width: 900px) { .main-grid { grid-template-columns: 1fr; } }
+
+/* ── Camera feeds ── */
+.cameras-section h2,
+.map-section h2,
+.timeline-section h2,
+.door-section h2 {
+  font-size: 13px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .06em;
+  margin-bottom: 10px;
+}
+.cameras {
+  display: flex; flex-wrap: wrap; gap: 12px;
+}
+.camera-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px; flex: 1 1 280px; max-width: 420px;
+}
+.camera-card-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 8px;
+}
+.camera-card-header span { font-size: 13px; font-weight: 600; }
+.cam-badge {
+  font-size: 10px; padding: 2px 7px; border-radius: 999px;
+  background: rgba(59,130,246,.2); color: var(--blue); font-weight: 600;
+}
+.camera-card img {
+  width: 100%; border-radius: 6px; background: #000;
+  display: block; aspect-ratio: 4/3; object-fit: contain;
+}
+
+/* ── Right column ── */
+.right-col { display: flex; flex-direction: column; gap: 16px; }
+
+/* ── Floor map SVG container ── */
+.map-section {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px;
+}
+#floor-svg { width: 100%; height: auto; display: block; }
+.room-rect {
+  transition: fill .35s, stroke .35s, filter .35s;
+  cursor: default;
+}
+.room-label { font-family: 'Segoe UI', Arial, sans-serif; pointer-events: none; }
+
+/* ── Room detail cards ── */
+.rooms-detail { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.room-detail-card {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 12px;
+  display: flex; align-items: center; gap: 10px;
+  transition: border-color .3s;
+}
+.room-detail-card.active { border-color: var(--green); }
+.room-detail-card.inferred { border-color: var(--yellow); }
+.room-dot {
+  width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+  background: var(--muted);
+}
+.room-dot.active { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.room-dot.inferred { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+.room-info { flex: 1; min-width: 0; }
+.room-info-name { font-size: 12px; font-weight: 600; }
+.room-info-sub { font-size: 11px; color: var(--muted); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.room-state-badge {
+  font-size: 10px; padding: 2px 7px; border-radius: 999px;
+  font-weight: 700; flex-shrink: 0;
+}
+.badge-tracking { background: rgba(34,197,94,.2); color: var(--green); }
+.badge-fallback { background: rgba(249,115,22,.2); color: var(--orange); }
+.badge-lost     { background: rgba(239,68,68,.2);  color: var(--red); }
+.badge-inferred { background: rgba(234,179,8,.2);  color: var(--yellow); }
+.badge-search   { background: rgba(59,130,246,.2); color: var(--blue); }
+.badge-empty    { background: rgba(100,116,139,.15); color: var(--muted); }
+
+/* ── Timeline ── */
+.timeline-section {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px; flex: 1;
+}
+.timeline-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 10px;
+}
+.timeline-header h2 { margin-bottom: 0; }
+#timeline-list {
+  max-height: 320px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 4px;
+}
+#timeline-list::-webkit-scrollbar { width: 4px; }
+#timeline-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.tl-item {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 5px 8px; border-radius: 6px; background: var(--surface2);
+  font-size: 11px; border-left: 3px solid transparent;
+}
+.tl-time { color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; width: 52px; }
+.tl-event { font-weight: 600; flex-shrink: 0; width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-detail { color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-ACQUIRED  { border-color: var(--green); }
+.tl-LOST      { border-color: var(--red); }
+.tl-REACQUIRED{ border-color: var(--blue); }
+.tl-IGNORED   { border-color: var(--muted); }
+.tl-INFERRED  { border-color: var(--yellow); }
+.tl-other     { border-color: var(--border); }
+
+/* ── Door control ── */
+.door-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  margin-top: 16px;
+}
+.door-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.door-card:last-of-type { margin-bottom: 12px; }
+.door-card-header {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.door-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.door-btn {
+  flex: 1;
+  padding: 12px;
+  font-size: 16px;
+  font-weight: bold;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.3s;
+  background: var(--muted);
+  color: var(--text);
+  opacity: 0.6;
+  pointer-events: none;
+}
+.door-btn.enabled {
+  background: var(--green);
+  color: #fff;
+  opacity: 1;
+  pointer-events: auto;
+}
+.door-btn.enabled:hover {
+  filter: brightness(1.2);
+  transform: scale(1.02);
+}
+.door-status {
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 80px;
+  text-align: center;
+}
+.door-status.open { color: var(--green); }
+.door-status.closed { color: var(--muted); }
+.door-status.unknown { color: var(--orange); }
+.door-info {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+/* ── Exercise panel ── */
+.exercise-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  margin-top: 16px;
+}
+.exercise-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.exercise-form select,
+.exercise-form input {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.exercise-form select#exPersonSelect { flex: 1 1 120px; }
+.exercise-form select#exTypeSelect { flex: 0 0 100px; }
+.exercise-form input#exRepsInput { flex: 0 0 70px; }
+.btn-primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+.btn-primary:hover { filter: brightness(1.15); }
+
+.exercise-table-wrap { overflow-x: auto; }
+.exercise-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.exercise-table th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.exercise-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.exercise-table .ex-empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 14px;
+}
+.ex-check { color: var(--green); font-weight: 700; }
+.ex-dash { color: var(--muted); }
+.ex-badge {
+  font-size: 10px; padding: 2px 8px; border-radius: 999px; font-weight: 700;
+}
+.ex-online  { background: rgba(34,197,94,.2);  color: var(--green); }
+.ex-offline { background: rgba(100,116,139,.2); color: var(--muted); }
+.ex-success { background: rgba(34,197,94,.2);  color: var(--green); }
+.ex-fail    { background: rgba(239,68,68,.2);  color: var(--red); }
+.ex-pending { background: rgba(59,130,246,.2); color: var(--blue); }
+.ex-del-btn {
+  background: none; border: none; color: var(--red); cursor: pointer;
+  font-size: 14px; padding: 2px 6px;
+}
+.ex-del-btn:hover { opacity: .7; }
+#status-bar {
+  margin-top: 12px; font-size: 11px; color: var(--muted);
+  display: flex; gap: 16px; flex-wrap: wrap;
+}
+
+/* ── Pulse animations ── */
+@keyframes pulse-ring {
+  0%   { opacity: .7; r: 34px; }
+  100% { opacity: 0;  r: 46px; }
+}
+.pulse-active { animation: pulse-ring 1.2s ease-out infinite; }
+@keyframes pulse-ring-slow {
+  0%   { opacity: .5; r: 34px; }
+  100% { opacity: 0;  r: 44px; }
+}
+.pulse-inferred { animation: pulse-ring-slow 2s ease-out infinite; }
+
+.btn-register {
+  display: inline-block;
+  padding: 8px 16px;
+  background: #007bff;
+  color: white;
+  text-decoration: none;
+  border-radius: 5px;
+  font-weight: bold;
+}
+.btn-register:hover { background: #0056b3; }

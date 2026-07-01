@@ -10,13 +10,13 @@ pyserial
 numpy
 scipy
 transformers
-mediapipe
+mediapipe==0.10.21
 flask
 rembg
 huggingface_hub
 
 onnxruntime==1.20.1
-
+websockets
 flask-socketio 
 eventlet
 

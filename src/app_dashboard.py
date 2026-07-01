@@ -24,10 +24,14 @@ import time
 
 import cv2
 from flask import Flask, Response, jsonify, render_template, request
+from flask_socketio import SocketIO, emit
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import config
+import face_database
 from operation.event_logger import EventLogger
+from operation.door_ws_server import DoorWebSocketServer
+from operation.exercise_manager import exercise_manager
 from app_operation import (
     RoomUnit,
     render_room_panel,
@@ -132,6 +136,12 @@ app = Flask(
     template_folder=os.path.join(os.path.dirname(__file__), "operation", "templates"),
     static_folder=os.path.join(os.path.dirname(__file__), "operation", "static"),
 )
+# async_mode="threading" on purpose: door_ws_server.py runs its own asyncio
+# event loop in a plain background thread. eventlet/gevent (the other
+# Flask-SocketIO async modes) monkey-patch the stdlib socket/threading
+# layer, which would silently break that asyncio loop. "threading" mode
+# keeps everything on normal OS threads so the two coexist safely.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # ---------------------------------------------------------------------------
 # Shared state, built once at startup (see start_system() below).
@@ -153,11 +163,139 @@ _cam_to_room = {
     if r["cam_id"] is not None
 }
 
+# ---------------------------------------------------------------------------
+# Door (ESP32 servo) state -- ONE DOOR PER ROOM/CAMERA
+# ---------------------------------------------------------------------------
+# Doors are keyed by the SAME id as config.CAMERAS[*]["id"] (e.g. "cam1",
+# "cam2"). BOTH doors are driven by a SINGLE physical ESP32 Dev Module
+# board with two servos, multiplexed over one WebSocket connection using
+# a "door" field in every message (see esp32_servo.ino / door_ws_server.py).
+# Each door can only be enabled/toggled based on ITS OWN room's presence;
+# rooms are never allowed to unlock each other's door, even though both
+# doors share the same underlying ESP32 connection.
+door_ws = None                  # DoorWebSocketServer, built in start_system()
+_door_lock = threading.Lock()
+_door_enabled = {}              # room_id -> bool (True while THAT room has a confirmed target)
+_door_last_seen_present = {}    # room_id -> time.time() of last confirmed presence
+_door_safety_thread = None
+_door_safety_running = False
+
+
+def _door_room_ids():
+    """Every room id that has a door -- currently: every camera room."""
+    return [cam["id"] for cam in config.CAMERAS]
+
+
+def _room_registered_present(room_id):
+    """
+    True if THIS SPECIFIC room currently has a CAMERA-CONFIRMED registered
+    target (i.e. its AIPipeline reached TRACKING with a locked identity).
+    Deliberately does NOT count InferenceEngine's "inferred presence" in
+    no-cam rooms, and deliberately does NOT look at any OTHER room -- a
+    door only ever unlocks from its own room's real face match.
+    """
+    with _room_status_lock:
+        return _room_has_target.get(room_id, False)
+
+
+def _push_door_status(room_id):
+    """Emit one room's door enable-flag/state/connection to all browsers."""
+    with _door_lock:
+        enabled = _door_enabled.get(room_id, False)
+    state = door_ws.get_state(room_id) if door_ws else "UNKNOWN"
+    connected = door_ws.is_connected(room_id) if door_ws else False
+    socketio.emit("door_status", {
+        "room_id": room_id,
+        "enabled": enabled,
+        "state": state,
+        "esp32_connected": connected,
+    })
+
+
+def _update_door_presence():
+    """
+    For EVERY room independently: recompute whether that room's door
+    button should be enabled, push an update to browsers if it changed,
+    and auto-close that room's door if nobody registered has been seen in
+    it for config.DOOR_AUTO_CLOSE_SEC seconds -- a safety net so a door
+    can't be left open indefinitely just because no one pressed 'close'.
+    """
+    now = time.time()
+
+    for room_id in _door_room_ids():
+        present = _room_registered_present(room_id)
+
+        with _door_lock:
+            was_enabled = _door_enabled.get(room_id, False)
+            _door_enabled[room_id] = present
+            if present:
+                _door_last_seen_present[room_id] = now
+            since_present = now - _door_last_seen_present.get(room_id, now)
+
+        if present != was_enabled:
+            _push_door_status(room_id)
+            if shared_logger:
+                shared_logger.log(
+                    "DOOR_ACCESS_ENABLED" if present else "DOOR_ACCESS_DISABLED",
+                    room=room_id,
+                )
+
+        timeout = getattr(config, "DOOR_AUTO_CLOSE_SEC", 15)
+        if (
+            timeout > 0
+            and not present
+            and since_present >= timeout
+            and door_ws is not None
+            and door_ws.get_state(room_id) == "OPEN"
+        ):
+            if door_ws.send_command(room_id, "CLOSE"):
+                if shared_logger:
+                    shared_logger.log(
+                        "DOOR_AUTO_CLOSED", room=room_id, after_sec=round(since_present, 1)
+                    )
+                _push_door_status(room_id)
+
+
+def _door_safety_loop():
+    """Background tick so presence/auto-close logic runs even if no
+    browser tab is open polling /api/room_status."""
+    while _door_safety_running:
+        try:
+            _update_door_presence()
+        except Exception as e:
+            print(f"[Door] safety loop error: {e}")
+        time.sleep(1.0)
+
+
+def _on_exercise_fail(name):
+    """
+    Called by exercise_manager the instant a person's result becomes
+    'fail' (wrong movement performed, or they went offline before
+    reaching their target rep count). Permanently deletes their face_db +
+    processed data and forces every room to drop any active lock on them,
+    so they can never be tracked again unless re-registered from scratch.
+    """
+    try:
+        face_database.delete_person(name)
+        print(f"[Exercise] FAIL -> deleted '{name}' from the face database")
+    except Exception as e:
+        print(f"[Exercise] Error deleting data for '{name}': {e}")
+
+    for room in rooms:
+        room.ai_thread.recognizer.load_database()
+        room.ai_thread.pose_estimator.reset(name)
+        if room.ai_thread.get_locked_identity() == name:
+            room.ai_thread.force_clear_target()
+
+    if shared_logger:
+        shared_logger.log("EXERCISE_FAILED_DELETED", name=name)
+
 
 def start_system():
     """Start one RoomUnit (camera + AI) per entry in config.CAMERAS.
     Called once, before the Flask server starts handling requests."""
     global shared_logger, rooms, inference_engine
+    global door_ws, _door_safety_thread, _door_safety_running
 
     validate_camera_config(config.CAMERAS)
 
@@ -172,21 +310,59 @@ def start_system():
     timeout = getattr(config, "INFERRED_PRESENCE_TIMEOUT_SEC", 60)
     inference_engine = InferenceEngine(floor_plan, timeout)
 
+    exercise_manager.set_on_fail_callback(_on_exercise_fail)
+
+    # --- Door WebSocket server: ONE physical ESP32 (Dev Module, 2 servos)
+    # connects IN to us as a single WebSocket client, and multiplexes
+    # BOTH doors' commands/states over that one connection using a
+    # "door" field per message (door id == the room's camera id). ---
+    for room_id in _door_room_ids():
+        _door_enabled[room_id] = False
+        _door_last_seen_present[room_id] = time.time()
+
+    def _on_door_state_change(room_id, state, connected):
+        # Called from the DoorWS asyncio thread. _push_door_status() only
+        # reads shared state under lock and emits, so this is safe to call
+        # directly from another thread.
+        _push_door_status(room_id)
+        if shared_logger:
+            shared_logger.log(
+                "DOOR_ESP32_CONNECTED" if connected else "DOOR_ESP32_DISCONNECTED",
+                room=room_id, state=state,
+            )
+
+    door_ws = DoorWebSocketServer(
+        host=getattr(config, "DOOR_WS_HOST", "0.0.0.0"),
+        port=getattr(config, "DOOR_WS_PORT", 8765),
+        door_ids=_door_room_ids(),
+        on_state_change=_on_door_state_change,
+    )
+    door_ws.start()
+
+    _door_safety_running = True
+    _door_safety_thread = threading.Thread(target=_door_safety_loop, daemon=True)
+    _door_safety_thread.start()
+
     print("\n--- WEB DASHBOARD SYSTEM RUNNING (multi-camera, fixed cameras) ---")
     print(f"Rooms: {[r.room_name for r in rooms]}")
     print(f"Floor plan: {[r['id'] for r in floor_plan]}")
     print(f"Inferred presence timeout: {timeout}s")
+    print(f"Door WebSocket: ws://{door_ws.host}:{door_ws.port}")
     print(f"Event log: {shared_logger.log_path}")
     print("Open http://localhost:5001 in your browser.")
     print("Press Ctrl+C in this terminal to stop safely.\n")
 
 
 def stop_system():
+    global _door_safety_running
     print("\n[Main] Stopping all camera/AI threads...")
+    _door_safety_running = False
     for room in rooms:
         room.stop()
     for room in rooms:
         room.join()
+    if door_ws:
+        door_ws.stop()
     if shared_logger:
         shared_logger.close()
     print("[Main] System shut down safely.")
@@ -350,6 +526,7 @@ def get_config():
         "inferred_presence_timeout_sec": getattr(config, "INFERRED_PRESENCE_TIMEOUT_SEC", 60),
         "floor_plan": getattr(config, "FLOOR_PLAN", []),
         "target_fps": config.TARGET_FPS,
+        "registration_port": getattr(config, "REGISTRATION_APP_PORT", 5000),
     })
 
 
@@ -376,6 +553,210 @@ def get_events():
 
 
 # ---------------------------------------------------------------------------
+# Door control (Socket.IO) -- bridges browser clicks to the single door
+# ESP32 over door_ws (a separate raw WebSocket connection carrying BOTH
+# doors, multiplexed by room_id -- see operation/door_ws_server.py)
+# ---------------------------------------------------------------------------
+@socketio.on("connect")
+def handle_connect():
+    """Send the current status of EVERY door right away so a freshly-opened
+    browser tab doesn't sit showing 'unknown' until the next presence
+    change in some room."""
+    for room_id in _door_room_ids():
+        with _door_lock:
+            enabled = _door_enabled.get(room_id, False)
+        state = door_ws.get_state(room_id) if door_ws else "UNKNOWN"
+        connected = door_ws.is_connected(room_id) if door_ws else False
+        emit("door_status", {
+            "room_id": room_id,
+            "enabled": enabled,
+            "state": state,
+            "esp32_connected": connected,
+        })
+
+
+@socketio.on("toggle_door")
+def handle_toggle_door(data):
+    """
+    Browser asked to open/close ONE SPECIFIC room's door. We re-check that
+    room's presence server-side -- never trust that the button was
+    actually disabled client-side -- and toggle relative to that room's
+    ESP32's last known real state. A room's presence can NEVER be used to
+    toggle another room's door.
+    """
+    room_id = (data or {}).get("room_id")
+    if not room_id or room_id not in _door_room_ids():
+        emit("door_response", {
+            "room_id": room_id,
+            "status": "error",
+            "message": "Phòng không hợp lệ.",
+        })
+        return
+
+    if not _room_registered_present(room_id):
+        emit("door_response", {
+            "room_id": room_id,
+            "status": "error",
+            "message": "Không phát hiện người đã đăng ký trong phòng này.",
+        })
+        return
+
+    if door_ws is None or not door_ws.is_connected(room_id):
+        emit("door_response", {
+            "room_id": room_id,
+            "status": "error",
+            "message": "ESP32 cửa của phòng này chưa kết nối tới server.",
+        })
+        return
+
+    target = "CLOSE" if door_ws.get_state(room_id) == "OPEN" else "OPEN"
+    ok = door_ws.send_command(room_id, target)
+
+    if ok:
+        if shared_logger:
+            shared_logger.log(f"DOOR_MANUAL_{target}", room=room_id, source="dashboard")
+        emit("door_response", {
+            "room_id": room_id,
+            "status": "success",
+            "message": "Cửa đã mở!" if target == "OPEN" else "Cửa đã đóng!",
+        })
+        _push_door_status(room_id)
+    else:
+        emit("door_response", {
+            "room_id": room_id,
+            "status": "error",
+            "message": "Không nhận được phản hồi từ ESP32 (timeout).",
+        })
+
+
+# ---------------------------------------------------------------------------
+# Exercise assignment API
+# ---------------------------------------------------------------------------
+@app.route("/api/registered_people")
+def registered_people():
+    """List every name currently in face_db, for the assignment dropdown."""
+    return jsonify({"names": face_database.list_people()})
+
+
+@app.route("/api/exercises")
+def get_exercises():
+    """Full assignment table for the dashboard panel."""
+    return jsonify({"rows": exercise_manager.get_table()})
+
+
+@app.route("/api/exercises/assign", methods=["POST"])
+def assign_exercise():
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get("name") or "").strip()
+    exercise = (data.get("exercise") or "").strip().lower()
+    target_reps = data.get("target_reps")
+
+    if not name:
+        return jsonify({"status": "error", "message": "Thiếu tên người đăng ký."}), 400
+    if not face_database.person_exists(name):
+        return jsonify({"status": "error", "message": f"'{name}' chưa được đăng ký khuôn mặt."}), 400
+    if exercise not in ("squat", "pushup"):
+        return jsonify({"status": "error", "message": "Động tác phải là 'squat' hoặc 'pushup'."}), 400
+    try:
+        target_reps = int(target_reps)
+        if target_reps < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Số lần thực hiện phải là số nguyên dương."}), 400
+
+    exercise_manager.assign(name, exercise, target_reps)
+    for room in rooms:
+        room.ai_thread.pose_estimator.reset(name)
+    if shared_logger:
+        shared_logger.log("EXERCISE_ASSIGNED", name=name, exercise=exercise, target_reps=target_reps)
+
+    return jsonify({"status": "ok", "rows": exercise_manager.get_table()})
+
+
+@app.route("/api/exercises/<name>", methods=["DELETE"])
+def delete_exercise_row(name):
+    """
+    Per-row delete button: removes the assignment. Per the spec, this
+    resets the person to 'off' with their rep count starting over from
+    zero -- it does NOT delete their face_db/processed data (that only
+    happens automatically on FAIL, never from this manual row-delete).
+    """
+    exercise_manager.unassign(name)
+    for room in rooms:
+        room.ai_thread.pose_estimator.reset(name)
+    if shared_logger:
+        shared_logger.log("EXERCISE_ROW_DELETED", name=name)
+    return jsonify({"status": "ok", "rows": exercise_manager.get_table()})
+
+
+# ---------------------------------------------------------------------------
+# People overview page -- combined view of every registered person: which
+# room they're currently seen in, that room's door status, and their
+# exercise assignment/progress/result.
+# ---------------------------------------------------------------------------
+def _room_lookup_by_cam_id(room_id):
+    return next((r for r in rooms if r.id == room_id), None)
+
+
+@app.route("/api/people_overview")
+def people_overview():
+    """
+    One row per registered person, merging:
+      - face_database (who is registered)
+      - each room's AIPipeline locked identity (which room currently sees them)
+      - door_ws (that room's door state, only meaningful if a room was found)
+      - exercise_manager (assigned exercise / reps / online / result)
+    """
+    names = face_database.list_people()
+    exercise_by_name = {row["name"]: row for row in exercise_manager.get_table()}
+
+    # Which room (if any) currently has each name locked as its target.
+    name_to_room_id = {}
+    for room in rooms:
+        identity = room.ai_thread.get_locked_identity()
+        if identity:
+            name_to_room_id[identity] = room.id
+
+    people = []
+    for name in names:
+        room_id = name_to_room_id.get(name)
+        room_obj = _room_lookup_by_cam_id(room_id) if room_id else None
+
+        door_state = "UNKNOWN"
+        door_enabled = False
+        door_connected = False
+        if room_obj is not None:
+            door_state = door_ws.get_state(room_id) if door_ws else "UNKNOWN"
+            door_connected = door_ws.is_connected(room_id) if door_ws else False
+            with _door_lock:
+                door_enabled = _door_enabled.get(room_id, False)
+
+        ex = exercise_by_name.get(name)
+
+        people.append({
+            "name": name,
+            "room_id": room_id,
+            "room_name": room_obj.room_name if room_obj else None,
+            "door_state": door_state,       # "OPEN" | "CLOSED" | "UNKNOWN"
+            "door_enabled": door_enabled,    # this room's presence-gate flag
+            "door_connected": door_connected,
+            "assigned": ex is not None,
+            "exercise": ex["exercise"] if ex else None,           # "squat" | "pushup" | None
+            "target_reps": ex["target_reps"] if ex else None,
+            "count": ex["count"] if ex else 0,
+            "online": ex["online"] if ex else False,
+            "result": ex["result"] if ex else None,               # None | "success" | "fail"
+        })
+
+    return jsonify({"people": people})
+
+
+@app.route("/people")
+def people_page():
+    return render_template("people.html")
+
+
+# ---------------------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------------------
 @app.route("/")
@@ -390,7 +771,8 @@ if __name__ == "__main__":
     start_system()
     try:
         # use_reloader=False is required: the reloader would otherwise spawn
-        # a second process and start every camera/AI thread twice.
-        app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False, threaded=True)
+        # a second process and start every camera/AI thread (and the door
+        # WebSocket server) twice.
+        socketio.run(app, host="0.0.0.0", port=5001, debug=False, use_reloader=False)
     finally:
         stop_system()

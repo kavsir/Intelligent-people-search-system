@@ -19,6 +19,7 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+import face_database
 
 # ---------------------------------------------------------------------------
 # Models
@@ -139,21 +140,9 @@ def get_face_landmarks(image_bgr):
 
 def save_face_data(name, embedding_list, image_list):
     """
-    Persist a person's embeddings and source images under:
-        data/face_db/<name>/embedding.npy
-        data/face_db/<name>/angle_1.jpg, angle_2.jpg, ...
+    Persist a person's embeddings and source images into the SQLite face
+    dataset (data/face_dataset.db) -- see face_database.py. Re-registering
+    the same name replaces their previous raw data.
     """
-    person_dir = os.path.join(config.FACE_DB_DIR, name)
-    os.makedirs(person_dir, exist_ok=True)
-
-    embeddings = np.array(embedding_list)
-    np.save(os.path.join(person_dir, "embedding.npy"), embeddings)
-
-    for index, img_bgr in enumerate(image_list):
-        img_name = (
-            f"angle_{index + 1}.jpg" if len(image_list) > 1 else "profile.jpg"
-        )
-        cv2.imwrite(os.path.join(person_dir, img_name), img_bgr)
-
-    print(f"[REGISTER] Saved {len(image_list)} image(s) for '{name}' -> {person_dir}")
-    return person_dir
+    face_database.save_face_data(name, embedding_list, image_list)
+    return name

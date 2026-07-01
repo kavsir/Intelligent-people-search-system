@@ -24,6 +24,7 @@ from ultralytics import YOLO
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+import face_database
 
 # ---------------------------------------------------------------------------
 # Load YOLO (face model, falling back to the general person model)
@@ -112,33 +113,23 @@ def process_background_pipeline(img):
 
 def process_person_background(name):
     """
-    Process every image registered for `name` under data/face_db/<name>
-    and write the result to data/processed/<name>.
+    Process every raw image registered for `name` (read from the SQLite
+    face dataset) and write the segmented+enhanced result back into the
+    database as that person's 'processed' images.
     """
-    source_dir = os.path.join(config.FACE_DB_DIR, name)
-    target_dir = os.path.join(config.PROCESSED_DIR, name)
+    raw_images = face_database.get_raw_images(name)
 
-    if not os.path.exists(source_dir):
-        print(f"[PREPROCESS] No source directory for '{name}'.")
+    if not raw_images:
+        print(f"[PREPROCESS] No raw images found for '{name}'.")
         return False
 
-    os.makedirs(target_dir, exist_ok=True)
-
-    valid_extensions = (".jpg", ".jpeg", ".png")
-    image_files = [
-        f for f in os.listdir(source_dir) if f.lower().endswith(valid_extensions)
-    ]
-
-    for file_name in image_files:
-        img_path = os.path.join(source_dir, file_name)
-        img = cv2.imread(img_path)
-        if img is None:
-            continue
-
+    processed_images = []
+    for img in raw_images:
         segmented_img = process_background_pipeline(img)
         final_img = enhance_image_quality(segmented_img)
+        processed_images.append(final_img)
 
-        cv2.imwrite(os.path.join(target_dir, file_name), final_img)
+    face_database.save_processed_images(name, processed_images)
 
     print(f"[PREPROCESS] Finished processing '{name}'.")
     return True

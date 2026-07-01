@@ -64,29 +64,53 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
+# Legacy "labeled folders" dataset layout. No longer written to -- kept
+# only so migrate_to_sqlite.py can read the old data once and import it
+# into FACE_DB_PATH below. Safe to delete these folders after migrating.
 FACE_DB_DIR = os.path.join(DATA_DIR, "face_db")
 PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
 
+# Current dataset storage: a single SQLite file holding every registered
+# person's embeddings + raw/processed images. See face_database.py.
+FACE_DB_PATH = os.path.join(DATA_DIR, "face_dataset.db")
+
 # ---------------------------------------------------------------------------
-# Cameras (ESP32-CAM MJPEG streams)
+# Door servo ESP32 (Dev Module) -- WebSocket
 # ---------------------------------------------------------------------------
-# Each ESP32-CAM streams MJPEG directly to this machine (no longer routed
-# through the ESP32-S3, which now only acts as a coordination gateway over
-# HTTP/MQTT to tell each ESP32-CAM when to stream/snapshot/sleep).
-#
-# Cameras are fixed-position (no pan/tilt servo). Each one only detects and
-# recognizes whoever is in its own room; there is no mechanism that moves
-# the camera to follow a person.
+# ONE physical ESP32 Dev Module drives BOTH door servos (Phòng 1 + Phòng 2)
+# and connects IN to this server as a single WebSocket *client* (see
+# operation/door_ws_server.py and esp32_servo.ino). Each door/room is
+# addressed by the same id as its entry in CAMERAS (e.g. "cam1", "cam2"),
+# multiplexed over that one connection -- we don't need to know the
+# ESP32's IP, we just bind and listen here.
+# ---------------------------------------------------------------------------
+# Cross-app links
+# ---------------------------------------------------------------------------
+# Port app_registration.py listens on (see its `app.run(..., port=...)`).
+# app_dashboard.py exposes this via /api/config so dashboard.html can build
+# a working "Đăng ký khuôn mặt" link regardless of which host/IP the
+# dashboard is being viewed from.
+REGISTRATION_APP_PORT = 5000
+
+DOOR_WS_HOST = "0.0.0.0"   # interface the door WebSocket server binds to
+DOOR_WS_PORT = 8765        # must match `ws_port` in esp32_servo.ino
+
+# Seconds with NO registered person seen in a room before THAT room's door
+# is force-closed automatically, even if nobody pressed its dashboard
+# button. Safety net so a door is never left open indefinitely. Applies
+# independently per room/door. 0 disables it.
+DOOR_AUTO_CLOSE_SEC = 15
+
 CAMERAS = [
     {
         "id": "cam1",
         "room_name": "Phong 1",
-        "url": "http://10.48.170.178/stream",
+        "url": "http://10.248.162.227/stream",
     },
     {
         "id": "cam2",
         "room_name": "Phong 2",
-        "url": "http://10.48.170.227/stream",
+        "url": "http:///stream",
     },
 ]
 

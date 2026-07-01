@@ -14,6 +14,24 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from operation.event_logger import EventLogger
 from operation.face_recognizer import FaceRecognizer
+from operation.pose_estimator import PoseEstimator
+from operation.exercise_manager import exercise_manager
+
+
+def _bbox_iou(a, b):
+    """Intersection-over-union of two [x1,y1,x2,y2] boxes."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
 
 
 class KalmanFilter2D:
@@ -67,10 +85,21 @@ class AIPipeline(threading.Thread):
             print(f"[AI:{self.room_name}] WARNING: face model not found, using person model.")
             self.yolo_face = YOLO(config.YOLO_PERSON_MODEL_PATH)
 
+        # Used only as a fallback in TRACKING when the locked person's
+        # face can no longer be recognized (too far / bad angle) -- lets
+        # us keep the lock on their BODY instead of losing them outright,
+        # and is also what feeds the exercise pose estimator.
+        self.yolo_person = YOLO(config.YOLO_PERSON_MODEL_PATH)
+
         self.recognizer = FaceRecognizer()
         self.recognizer.load_database()
         if self.recognizer.is_empty():
             print(f"[AI:{self.room_name}] WARNING: face_db empty.")
+
+        # One PoseEstimator per room (mediapipe Pose objects are not
+        # thread-safe, so this must never be shared across AIPipeline
+        # threads).
+        self.pose_estimator = PoseEstimator()
 
         self.kalman = KalmanFilter2D()
 
@@ -84,6 +113,11 @@ class AIPipeline(threading.Thread):
         self.locked_identity = None
         self.target_bbox = None
         self.target_center = None
+        # "FACE" while the locked person's face is still recognizable each
+        # frame, "BODY" while we're keeping the lock via YOLO-person + IOU
+        # continuity because their face faded out (they walked further
+        # away) but they haven't actually left the frame.
+        self.lock_mode = None
 
         # Tất cả khuôn mặt đã đăng ký trong frame hiện tại
         self.all_faces = []   # list of dict {name, bbox, score, center}
@@ -113,8 +147,23 @@ class AIPipeline(threading.Thread):
         self.locked_identity = None
         self.target_bbox = None
         self.target_center = None
+        self.lock_mode = None
         self.kalman.reset()
         self._set_output(False, None, None, None)
+
+    def force_clear_target(self):
+        """
+        Thread-safe external request to drop whatever this room is
+        currently locked onto and go back to SEARCHING. Used when the
+        locked person's registration data was just deleted (they failed
+        an assigned exercise), so we stop tracking someone who no longer
+        exists in face_db.
+        """
+        self.current_state = self.STATE_SEARCHING
+        self._clear_target()
+
+    def get_lock_mode(self):
+        return self.lock_mode
 
     def run(self):
         print(f"[AI:{self.room_name}] FSM started.")
@@ -196,6 +245,7 @@ class AIPipeline(threading.Thread):
             self.locked_identity = name
             self.target_bbox = list(bbox)
             self.target_center = center
+            self.lock_mode = "FACE"
             self.kalman.reset()
             kx, ky = self.kalman.predict_and_correct(center[0], center[1])
             self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
@@ -252,31 +302,96 @@ class AIPipeline(threading.Thread):
                 current_found = cand
                 break
 
-        if current_found is None:
-            # Mất target
-            self.lost_counter += 1
-            if self.lost_counter >= self.LOST_THRESHOLD:
-                # Thực sự lost
-                self.current_state = self.STATE_LOST
-                self.logger.log("TARGET_LOST", name=self.locked_identity, room=self.room_name)
-                print(f"[FSM:{self.room_name}] Lost '{self.locked_identity}' -> LOST")
-                self._clear_target()
-            else:
-                # Vẫn trong thời gian chờ, giữ target cũ (không đổi)
-                # Nhưng vẫn cập nhật vị trí nếu có mặt của target trong frame (dù không nhận diện được?) 
-                # Không có, giữ nguyên output
-                pass
-        else:
-            # Target hiện diện
+        if current_found is not None:
+            # Mặt vẫn nhận diện được bình thường -- đường đi cũ, không đổi.
             self.lost_counter = 0
+            self.lock_mode = "FACE"
             bbox, name, score, center = current_found
             self.target_bbox = list(bbox)
             self.target_center = center
             kx, ky = self.kalman.predict_and_correct(center[0], center[1])
             self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
-
+            self._run_exercise_tracking(frame, self.target_bbox)
             # KHÔNG CHUYỂN TARGET KHI CÓ NGƯỜI KHÁC – chỉ chuyển khi target hiện tại biến mất
-            # => giữ target ổn định
+            return
+
+        # Không nhận diện được mặt target ở frame này -- thử khoá theo
+        # THÂN NGƯỜI (người đó có thể đã đi xa hơn, mặt quá nhỏ/lệch góc
+        # để nhận diện, nhưng vẫn còn trong khung hình ở vị trí gần với
+        # bbox cũ).
+        body_bbox = self._find_body_continuity(frame)
+        if body_bbox is not None:
+            self.lost_counter = 0
+            self.lock_mode = "BODY"
+            cx = (body_bbox[0] + body_bbox[2]) // 2
+            cy = (body_bbox[1] + body_bbox[3]) // 2
+            self.target_bbox = list(body_bbox)
+            self.target_center = (cx, cy)
+            kx, ky = self.kalman.predict_and_correct(cx, cy)
+            self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+            self._run_exercise_tracking(frame, self.target_bbox)
+            return
+
+        # Cả mặt lẫn thân đều không tìm thấy -- thực sự có thể đã mất.
+        self.lost_counter += 1
+        if self.lost_counter >= self.LOST_THRESHOLD:
+            self.current_state = self.STATE_LOST
+            self.logger.log("TARGET_LOST", name=self.locked_identity, room=self.room_name)
+            print(f"[FSM:{self.room_name}] Lost '{self.locked_identity}' -> LOST")
+            exercise_manager.set_online(self.locked_identity, False)
+            self._clear_target()
+        # else: vẫn trong thời gian chờ (grace period), giữ nguyên output cũ.
+
+    def _find_body_continuity(self, frame):
+        """
+        Khi mặt của target đang khoá không còn nhận diện được ở frame này,
+        thử khoá tiếp theo THÂN NGƯỜI: chạy YOLO-person, so khớp IOU với
+        bbox cuối cùng đã biết. Trả về bbox mới (list[int,4]) nếu khớp đủ
+        tốt, ngược lại trả về None.
+        """
+        if self.target_bbox is None:
+            return None
+        try:
+            results = self.yolo_person(frame, verbose=False, device=self.device, classes=[0])
+        except Exception as e:
+            print(f"[AI:{self.room_name}] yolo_person error: {e}")
+            return None
+
+        best_iou = 0.0
+        best_box = None
+        for r in results:
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                iou = _bbox_iou(xyxy, self.target_bbox)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_box = xyxy
+
+        if best_box is not None and best_iou >= 0.25:
+            return list(best_box)
+        return None
+
+    def _run_exercise_tracking(self, frame, bbox):
+        """
+        If the currently-locked person has an assigned exercise, mark them
+        online and feed their body crop into this room's PoseEstimator.
+        Any completed rep is reported to the global exercise_manager.
+        Skipped entirely (cheap no-op) for people with no assignment, to
+        avoid spending CPU on mediapipe for everyone walking past a camera.
+        """
+        name = self.locked_identity
+        if name is None or not exercise_manager.is_assigned(name):
+            return
+
+        exercise_manager.set_online(name, True)
+        crop = _crop_safe(frame, bbox)
+        result = self.pose_estimator.process(name, crop)
+        if result["rep_completed"]:
+            exercise_manager.register_rep(name, result["rep_completed"])
+            self.logger.log(
+                "EXERCISE_REP", name=name, exercise=result["rep_completed"], room=self.room_name
+            )
+            print(f"[Exercise:{self.room_name}] '{name}' completed a {result['rep_completed']} rep")
 
     # =============================================
     # LOST – tìm lại bất kỳ ai đã đăng ký
@@ -321,6 +436,7 @@ class AIPipeline(threading.Thread):
             self.locked_identity = name
             self.target_bbox = bbox
             self.target_center = center
+            self.lock_mode = "FACE"
             self.kalman.reset()
             kx, ky = self.kalman.predict_and_correct(center[0], center[1])
             self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))

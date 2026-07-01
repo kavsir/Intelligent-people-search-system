@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Người đăng ký - AIoT Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='people.css') }}">
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>👤 Người đăng ký</h1>
+    <div class="subtitle">Phòng &middot; trạng thái cửa &middot; bài tập đang thực hiện</div>
+  </div>
+  <div class="header-right">
+    <span id="clock">--:--:--</span>
+    <a class="btn" href="/">← Bảng điều khiển</a>
+  </div>
+</div>
+
+<div class="people-section">
+  <div class="people-table-wrap">
+    <table class="people-table">
+      <thead>
+        <tr>
+          <th>Người</th>
+          <th>Phòng</th>
+          <th>Trạng thái cửa</th>
+          <th>Số lần thực hiện</th>
+          <th>Trạng thái</th>
+          <th>Kết quả</th>
+        </tr>
+      </thead>
+      <tbody id="people-tbody">
+        <tr><td colspan="7" class="pp-empty">Đang tải...</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div id="people-status-bar">
+    <span id="people-status-update">Đang kết nối...</span>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='people.js') }}"></script>
+</body>
+</html>
