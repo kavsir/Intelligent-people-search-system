@@ -42,8 +42,26 @@
         {% endfor %}
       </div>
     </div>
-
-    <div class="timeline-section">
+  
+  <div class="timeline-section"><!-- 🚪 Door Control (one per room -- each door only unlocks for its own room's registered person) -->
+    <div class="door-section">
+      <h2>🚪 Điều khiển cửa</h2>
+      {% for room in rooms %}
+      <div class="door-card" id="door-card-{{ room.id }}">
+        <div class="door-card-header">{{ room.room_name }}</div>
+        <div class="door-control">
+          <button id="doorBtn-{{ room.id }}" class="door-btn" onclick="toggleDoor('{{ room.id }}')">
+            🔒 Mở cửa
+          </button>
+          <span id="doorStatusText-{{ room.id }}" class="door-status unknown">⏳ Đang chờ...</span>
+        </div>
+      </div>
+      {% endfor %}
+      <div class="door-info">
+        💡 Nút cửa luôn hoạt động bình thường. Khi hệ thống phát hiện <strong>người đã đăng ký</strong> ở bất kỳ phòng nào, toàn bộ cửa sẽ tự động <strong>đóng lại</strong> — muốn mở phải bấm nút thủ công.
+      </div>
+    </div>
+    
       <div class="timeline-header">
         <h2>📋 Lịch sử sự kiện</h2>
         <button class="btn" onclick="clearTimeline()">Xóa</button>
@@ -138,25 +156,6 @@
 
       <!-- Room detail cards -->
       <div class="rooms-detail" id="rooms-detail"></div>
-    </div>
-
-    <!-- 🚪 Door Control (one per room -- each door only unlocks for its own room's registered person) -->
-    <div class="door-section">
-      <h2>🚪 Điều khiển cửa</h2>
-      {% for room in rooms %}
-      <div class="door-card" id="door-card-{{ room.id }}">
-        <div class="door-card-header">{{ room.room_name }}</div>
-        <div class="door-control">
-          <button id="doorBtn-{{ room.id }}" class="door-btn" onclick="toggleDoor('{{ room.id }}')">
-            🔒 Mở cửa
-          </button>
-          <span id="doorStatusText-{{ room.id }}" class="door-status unknown">⏳ Đang chờ...</span>
-        </div>
-      </div>
-      {% endfor %}
-      <div class="door-info">
-        💡 Nút cửa luôn hoạt động bình thường. Khi hệ thống phát hiện <strong>người đã đăng ký</strong> ở bất kỳ phòng nào, toàn bộ cửa sẽ tự động <strong>đóng lại</strong> — muốn mở phải bấm nút thủ công.
-      </div>
     </div>
 
   </div>

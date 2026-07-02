@@ -1,3 +1,4 @@
+# face_database.py
 """
 SQLite-backed storage for the face dataset.
 
@@ -18,6 +19,9 @@ Schema:
                      operation/behavior_manager.py. NOT reset between rows
                      -- each row is "the running total as of `logged_at`",
                      so the dashboard/report can plot activity over time.
+    theo_doi      -- tracking snapshots: mỗi lần danh sách người đăng ký thay đổi
+                     (thêm/xóa/di chuyển phòng), chụp ảnh mỗi phòng có người
+                     và lưu kèm thông tin người + phòng + thời gian.
 
 Every other module (face_registrar, image_preprocessor, face_recognizer,
 app_dashboard) goes through this module instead of touching the filesystem
@@ -86,10 +90,20 @@ CREATE TABLE IF NOT EXISTS behavior_log (
     logged_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS theo_doi (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_name TEXT NOT NULL,
+    room_name   TEXT NOT NULL,
+    image_data  BLOB NOT NULL,      -- JPEG bytes từ camera của phòng đó
+    captured_at TEXT NOT NULL       -- thời gian thực chụp
+);
+
 CREATE INDEX IF NOT EXISTS idx_embeddings_person ON embeddings(person_id);
 CREATE INDEX IF NOT EXISTS idx_images_person_kind ON images(person_id, kind);
 CREATE INDEX IF NOT EXISTS idx_behavior_log_person_time
     ON behavior_log(person_name, logged_at);
+CREATE INDEX IF NOT EXISTS idx_theo_doi_person ON theo_doi(person_name);
+CREATE INDEX IF NOT EXISTS idx_theo_doi_time ON theo_doi(captured_at);
 """
 
 
@@ -367,6 +381,104 @@ def delete_behavior_history(name):
     if you want a full reset, not just an unregister."""
     with _lock, _connect() as conn:
         conn.execute("DELETE FROM behavior_log WHERE person_name = ?", (name,))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Theo dõi (tracking) snapshots
+# ---------------------------------------------------------------------------
+# Mỗi lần danh sách người đăng ký thay đổi (thêm/xóa/di chuyển phòng),
+# chụp ảnh từng phòng có người và lưu vào bảng theo_doi.
+# Quy tắc:
+#   - Thêm người → chụp
+#   - Giảm người (từ N→N-1, N-1→N-2, ...) → chụp mỗi lần giảm
+#   - Giảm về 0 (không còn ai) → KHÔNG chụp
+#   - Người di chuyển phòng (danh sách tên không đổi nhưng phòng thay đổi) → chụp
+# ---------------------------------------------------------------------------
+
+def save_tracking_snapshot(entries, image_by_room, timestamp=None):
+    """
+    Save a tracking snapshot: for each person currently detected in a room,
+    store a row with that room's camera frame as JPEG.
+
+    entries: [{"name": "alice", "room_name": "Phòng 1"}, ...]
+    image_by_room: {"Phòng 1": jpeg_bytes, "Phòng 2": jpeg_bytes, ...}
+                   map từ room_name → JPEG bytes của frame camera phòng đó
+    timestamp: str (định dạng "YYYY-MM-DD HH:MM:SS"), mặc định dùng thời gian hiện tại
+    """
+    if not entries:
+        return
+    if timestamp is None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+    with _lock, _connect() as conn:
+        for entry in entries:
+            room_name = entry["room_name"]
+            jpeg_data = image_by_room.get(room_name)
+            if jpeg_data is None:
+                # Không có ảnh cho phòng này, bỏ qua người này
+                continue
+            conn.execute(
+                "INSERT INTO theo_doi (person_name, room_name, image_data, captured_at) "
+                "VALUES (?, ?, ?, ?)",
+                (entry["name"], room_name, jpeg_data, timestamp),
+            )
+        conn.commit()
+
+    print(f"[FaceDatabase] Saved tracking snapshot: {len(entries)} person(s), {len(image_by_room)} room(s)")
+
+
+def get_latest_tracking():
+    """
+    Return the most recent tracking snapshot for each person.
+    Returns: {name: {"room_name": str, "image_data": bytes|None, "captured_at": str|None}}
+    Nếu người chưa từng được theo dõi, sẽ không có key trong dict trả về.
+    """
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT t.* FROM theo_doi t "
+            "JOIN (SELECT person_name, MAX(id) AS max_id FROM theo_doi "
+            "      GROUP BY person_name) latest "
+            "ON t.person_name = latest.person_name AND t.id = latest.max_id"
+        ).fetchall()
+
+    result = {}
+    for r in rows:
+        result[r["person_name"]] = {
+            "room_name": r["room_name"],
+            "image_data": bytes(r["image_data"]) if r["image_data"] else None,
+            "captured_at": r["captured_at"],
+        }
+    return result
+
+
+def get_tracking_history(name, limit=100):
+    """
+    Return all tracking snapshots for one person, newest first.
+    Handy for a "history" view on the people page.
+    """
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT room_name, image_data, captured_at "
+            "FROM theo_doi WHERE person_name = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (name, limit),
+        ).fetchall()
+    return [
+        {
+            "room_name": r["room_name"],
+            "image_data": bytes(r["image_data"]) if r["image_data"] else None,
+            "captured_at": r["captured_at"],
+        }
+        for r in rows
+    ]
+
+
+def delete_tracking_history(name):
+    """Wipe a person's theo_doi rows -- call alongside delete_person()
+    if you want a full reset."""
+    with _lock, _connect() as conn:
+        conn.execute("DELETE FROM theo_doi WHERE person_name = ?", (name,))
         conn.commit()
 
 

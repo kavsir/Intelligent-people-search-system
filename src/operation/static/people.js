@@ -17,6 +17,17 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+/**
+ * Format timestamp từ SQLite ("2024-01-15 14:30:25") thành "14:30:25"
+ * để hiển thị ngắn gọn dưới ảnh.
+ */
+function formatTime(sqliteTime) {
+  if (!sqliteTime) return '';
+  // Cắt lấy phần thời gian (sau khoảng trắng)
+  const parts = sqliteTime.split(' ');
+  return parts.length >= 2 ? parts[1] : sqliteTime;
+}
+
 function renderRow(p) {
   const room = p.room_name
     ? `<span class="pp-room">${escapeHtml(p.room_name)}</span>`
@@ -27,9 +38,27 @@ function renderRow(p) {
     ? `<span class="pp-door ${door.cls}">${door.text}</span>`
     : `<span class="pp-door pp-door-unknown">—</span>`;
 
+  // Ảnh theo dõi
+  let photoCell;
+  if (p.tracking_image) {
+    const timeStr = formatTime(p.tracking_time);
+    photoCell = `
+      <div class="pp-photo-wrap">
+        <img class="pp-photo" 
+             src="data:image/jpeg;base64,${p.tracking_image}" 
+             alt="${escapeHtml(p.name)}"
+             loading="lazy">
+        <span class="pp-photo-time">${timeStr}</span>
+      </div>
+    `;
+  } else {
+    photoCell = `<span class="pp-photo-empty">Chưa chụp</span>`;
+  }
+
   return `
     <tr>
       <td class="pp-name">${escapeHtml(p.name)}</td>
+      <td class="pp-photo-cell">${photoCell}</td>
       <td>${room}</td>
       <td>${doorCell}</td>
     </tr>
@@ -43,7 +72,7 @@ async function pollPeople() {
     const tbody = document.getElementById('people-tbody');
 
     if (!data.people || data.people.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="3" class="pp-empty">Chưa có ai được đăng ký khuôn mặt.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="4" class="pp-empty">Chưa có ai được đăng ký khuôn mặt.</td></tr>`;
     } else {
       tbody.innerHTML = data.people.map(renderRow).join('');
     }
