@@ -95,11 +95,15 @@ REGISTRATION_APP_PORT = 5000
 DOOR_WS_HOST = "0.0.0.0"   # interface the door WebSocket server binds to
 DOOR_WS_PORT = 8765        # must match `ws_port` in esp32_servo.ino
 
-# Seconds with NO registered person seen in a room before THAT room's door
-# is force-closed automatically, even if nobody pressed its dashboard
-# button. Safety net so a door is never left open indefinitely. Applies
-# independently per room/door. 0 disables it.
-DOOR_AUTO_CLOSE_SEC = 15
+# Door lockdown model (see app_dashboard.py's _lockdown_all_doors):
+#   - With nobody registered detected anywhere, every door button works
+#     normally -- open/close on request, no auto behavior.
+#   - The instant a registered person is detected in ANY room, every door
+#     in the system is force-closed automatically. Doors never reopen by
+#     themselves afterwards -- opening always requires a manual dashboard
+#     button press, regardless of who's present.
+# There is no "close after N seconds of absence" timer anymore: closing is
+# triggered by presence being detected, not by absence.
 
 CAMERAS = [
     {
@@ -110,7 +114,7 @@ CAMERAS = [
     {
         "id": "cam2",
         "room_name": "Phong 2",
-        "url": "http:///stream",
+        "url": "http://10.153.15.227/stream",
     },
 ]
 
@@ -180,6 +184,11 @@ SEARCHING_SKIP_FRAMES = 2
 STEP_SLEEP_SEC = 0.01
 STEP_SLEEP_SKIP_IF_STEP_TOOK_LONGER_THAN_SEC = 0.03
 
+
+# ---------------------------------------------------------------------------
+# Behavior recognition (Đứng / Di chuyển / Nhảy / Giơ tay / Nằm)
+# ---------------------------------------------------------------------------
+BEHAVIOR_SNAPSHOT_INTERVAL_SEC = 5
 # ---------------------------------------------------------------------------
 # Floor plan & inferred presence
 # ---------------------------------------------------------------------------

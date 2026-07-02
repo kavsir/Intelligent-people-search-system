@@ -8,10 +8,16 @@ with a single portable database file:
     data/face_dataset.db
 
 Schema:
-    persons     -- one row per registered person
-    embeddings  -- one row per captured angle's 512-D InsightFace embedding
-    images      -- one row per stored image (raw capture OR background-
-                   removed "processed" version), stored as JPEG bytes (BLOB)
+    persons       -- one row per registered person
+    embeddings    -- one row per captured angle's 512-D InsightFace embedding
+    images        -- one row per stored image (raw capture OR background-
+                     removed "processed" version), stored as JPEG bytes (BLOB)
+    behavior_log  -- time-series snapshots of every registered person's
+                     cumulative behavior counters (Đứng, Di chuyển, Nhảy,
+                     Giơ tay, Nằm, squat, hít đất), written every 5s by
+                     operation/behavior_manager.py. NOT reset between rows
+                     -- each row is "the running total as of `logged_at`",
+                     so the dashboard/report can plot activity over time.
 
 Every other module (face_registrar, image_preprocessor, face_recognizer,
 app_dashboard) goes through this module instead of touching the filesystem
@@ -24,6 +30,7 @@ Migrating existing folder-based data: run migrate_to_sqlite.py once.
 import os
 import sqlite3
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -35,8 +42,12 @@ DB_PATH = getattr(config, "FACE_DB_PATH", os.path.join(config.DATA_DIR, "face_da
 # sqlite3 connections aren't shared across threads; a short-lived connection
 # per call plus a module-level lock keeps writes/reads safe across the
 # registration Flask app, the dashboard Flask app, and every AIPipeline
-# thread that calls load_all_embeddings().
+# thread that calls load_all_embeddings() / log_behavior_snapshot().
 _lock = threading.Lock()
+
+# Columns tracked in behavior_log, in display order. Keep this in sync with
+# operation/behavior_manager.py's BEHAVIORS tuple.
+BEHAVIOR_COLUMNS = ("stand", "move", "jump", "raise_hand", "lie", "squat", "pushup")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS persons (
@@ -62,8 +73,23 @@ CREATE TABLE IF NOT EXISTS images (
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS behavior_log (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_name      TEXT NOT NULL,
+    stand_count      INTEGER NOT NULL DEFAULT 0,
+    move_count       INTEGER NOT NULL DEFAULT 0,
+    jump_count       INTEGER NOT NULL DEFAULT 0,
+    raise_hand_count INTEGER NOT NULL DEFAULT 0,
+    lie_count        INTEGER NOT NULL DEFAULT 0,
+    squat_count      INTEGER NOT NULL DEFAULT 0,
+    pushup_count     INTEGER NOT NULL DEFAULT 0,
+    logged_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_embeddings_person ON embeddings(person_id);
 CREATE INDEX IF NOT EXISTS idx_images_person_kind ON images(person_id, kind);
+CREATE INDEX IF NOT EXISTS idx_behavior_log_person_time
+    ON behavior_log(person_name, logged_at);
 """
 
 
@@ -112,7 +138,11 @@ def list_people():
 def delete_person(name):
     """Remove a person and (via ON DELETE CASCADE) all their embeddings and
     images. Replaces shutil.rmtree() on face_db/<name> and processed/<name>.
-    Returns True if a row was actually deleted."""
+    Returns True if a row was actually deleted.
+
+    Note: behavior_log rows are kept (they're a historical activity report,
+    not "current registration state"), matched only by person_name -- call
+    delete_behavior_history(name) too if you want a full wipe."""
     with _lock, _connect() as conn:
         cur = conn.execute("DELETE FROM persons WHERE name = ?", (name,))
         conn.commit()
@@ -239,6 +269,105 @@ def load_all_embeddings():
         database.setdefault(r["name"], []).append(vec)
 
     return {name: np.stack(vectors) for name, vectors in database.items()}
+
+
+# ---------------------------------------------------------------------------
+# Behavior recognition log (Đứng / Di chuyển / Nhảy / Giơ tay / Nằm / squat /
+# hít đất) -- written by operation/behavior_manager.py every 5s.
+# ---------------------------------------------------------------------------
+def log_behavior_snapshot(counts_by_person):
+    """
+    Insert ONE row per person into behavior_log, timestamped with the
+    current real time (SQLite's own localtime clock, so `logged_at` is a
+    real wall-clock time, not simulation time).
+
+    counts_by_person: {
+        "alice": {"stand": 12, "move": 3, "jump": 1, "raise_hand": 2,
+                   "lie": 0, "squat": 8, "pushup": 0},
+        ...
+    }
+    Missing keys default to 0. Called every BEHAVIOR_SNAPSHOT_INTERVAL_SEC
+    seconds by BehaviorManager's background thread -- counts are the
+    person's RUNNING TOTAL as of that moment (not reset each snapshot), so
+    plotting logged_at vs each *_count column gives an activity-over-time
+    curve for the technical report.
+    """
+    if not counts_by_person:
+        return
+
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+    with _lock, _connect() as conn:
+        for name, counts in counts_by_person.items():
+            conn.execute(
+                "INSERT INTO behavior_log "
+                "(person_name, stand_count, move_count, jump_count, "
+                " raise_hand_count, lie_count, squat_count, pushup_count, logged_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    name,
+                    counts.get("stand", 0),
+                    counts.get("move", 0),
+                    counts.get("jump", 0),
+                    counts.get("raise_hand", 0),
+                    counts.get("lie", 0),
+                    counts.get("squat", 0),
+                    counts.get("pushup", 0),
+                    now_str,
+                ),
+            )
+        conn.commit()
+
+
+def get_latest_behavior_counts():
+    """
+    Return {name: {"stand":..,...,"logged_at":..}} using each person's most
+    recent behavior_log row -- what the dashboard's behavior table shows
+    right now.
+    """
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT b.* FROM behavior_log b "
+            "JOIN (SELECT person_name, MAX(id) AS max_id FROM behavior_log "
+            "      GROUP BY person_name) latest "
+            "ON b.person_name = latest.person_name AND b.id = latest.max_id"
+        ).fetchall()
+
+    result = {}
+    for r in rows:
+        result[r["person_name"]] = {
+            "stand": r["stand_count"],
+            "move": r["move_count"],
+            "jump": r["jump_count"],
+            "raise_hand": r["raise_hand_count"],
+            "lie": r["lie_count"],
+            "squat": r["squat_count"],
+            "pushup": r["pushup_count"],
+            "logged_at": r["logged_at"],
+        }
+    return result
+
+
+def get_behavior_history(name, limit=500):
+    """Time-ordered snapshots for one person -- e.g. for an activity chart
+    on the dashboard's per-person detail view."""
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT stand_count, move_count, jump_count, raise_hand_count, "
+            "       lie_count, squat_count, pushup_count, logged_at "
+            "FROM behavior_log WHERE person_name = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (name, limit),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def delete_behavior_history(name):
+    """Wipe a person's behavior_log rows -- call alongside delete_person()
+    if you want a full reset, not just an unregister."""
+    with _lock, _connect() as conn:
+        conn.execute("DELETE FROM behavior_log WHERE person_name = ?", (name,))
+        conn.commit()
 
 
 # Ensure the DB/tables exist as soon as this module is imported, same as

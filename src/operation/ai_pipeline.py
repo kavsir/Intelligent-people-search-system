@@ -16,6 +16,7 @@ from operation.event_logger import EventLogger
 from operation.face_recognizer import FaceRecognizer
 from operation.pose_estimator import PoseEstimator
 from operation.exercise_manager import exercise_manager
+from operation.behavior_manager import behavior_manager
 
 
 def _bbox_iou(a, b):
@@ -311,7 +312,7 @@ class AIPipeline(threading.Thread):
             self.target_center = center
             kx, ky = self.kalman.predict_and_correct(center[0], center[1])
             self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
-            self._run_exercise_tracking(frame, self.target_bbox)
+            self._run_exercise_tracking(frame, self.target_bbox, center=(kx, ky))
             # KHÔNG CHUYỂN TARGET KHI CÓ NGƯỜI KHÁC – chỉ chuyển khi target hiện tại biến mất
             return
 
@@ -329,7 +330,7 @@ class AIPipeline(threading.Thread):
             self.target_center = (cx, cy)
             kx, ky = self.kalman.predict_and_correct(cx, cy)
             self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
-            self._run_exercise_tracking(frame, self.target_bbox)
+            self._run_exercise_tracking(frame, self.target_bbox, center=(kx, ky))
             return
 
         # Cả mặt lẫn thân đều không tìm thấy -- thực sự có thể đã mất.
@@ -371,27 +372,60 @@ class AIPipeline(threading.Thread):
             return list(best_box)
         return None
 
-    def _run_exercise_tracking(self, frame, bbox):
+    def _run_exercise_tracking(self, frame, bbox, center=None):
         """
-        If the currently-locked person has an assigned exercise, mark them
-        online and feed their body crop into this room's PoseEstimator.
-        Any completed rep is reported to the global exercise_manager.
-        Skipped entirely (cheap no-op) for people with no assignment, to
-        avoid spending CPU on mediapipe for everyone walking past a camera.
+        Feed the currently-locked (recognized, registered) person's body
+        crop into this room's PoseEstimator every frame. This now covers
+        two independent things:
+
+          1) Exercise rep counting (squat/pushup), scored against
+             exercise_manager ONLY if that person currently has an
+             assignment -- unchanged behavior.
+          2) General behavior recognition (Đứng/Di chuyển/Nhảy/Giơ tay/
+             Nằm), which always runs for ANY recognized registered
+             person, assignment or not -- these are ordinary behaviors,
+             not exercises, so they're tracked unconditionally in
+             behavior_manager.
+
+        NOTE on CPU cost: this used to skip mediapipe entirely for
+        unassigned people to save CPU. Now that behavior recognition must
+        run for everyone recognized (not just assigned people), mediapipe
+        runs on every frame a registered person is locked, assigned or
+        not. If that turns out too heavy running multiple rooms at once,
+        consider throttling this call (e.g. every 2nd/3rd frame) rather
+        than skipping it outright.
         """
         name = self.locked_identity
-        if name is None or not exercise_manager.is_assigned(name):
+        if name is None:
             return
 
-        exercise_manager.set_online(name, True)
+        is_assigned = exercise_manager.is_assigned(name)
+        if is_assigned:
+            exercise_manager.set_online(name, True)
+
+        # IMPORTANT: pass the Kalman-SMOOTHED center (the same one drawn as
+        # the crosshair on the dashboard), not the raw per-frame detection
+        # center. Raw YOLO box centers jitter by several pixels frame-to-
+        # frame even while the person stands still, which used to make
+        # jump/move detection fire randomly on pure detector noise.
         crop = _crop_safe(frame, bbox)
-        result = self.pose_estimator.process(name, crop)
-        if result["rep_completed"]:
+        result = self.pose_estimator.process(name, crop, bbox_center=center)
+
+        if is_assigned and result["rep_completed"]:
             exercise_manager.register_rep(name, result["rep_completed"])
             self.logger.log(
                 "EXERCISE_REP", name=name, exercise=result["rep_completed"], room=self.room_name
             )
             print(f"[Exercise:{self.room_name}] '{name}' completed a {result['rep_completed']} rep")
+
+        if result["behavior_events"]:
+            behavior_manager.record_many(name, result["behavior_events"])
+            self.logger.log(
+                "BEHAVIOR_DETECTED",
+                name=name,
+                events=",".join(result["behavior_events"]),
+                room=self.room_name,
+            )
 
     # =============================================
     # LOST – tìm lại bất kỳ ai đã đăng ký
@@ -470,4 +504,4 @@ class AIPipeline(threading.Thread):
             return self.last_detect_ms, self.last_recognize_ms
 
     def stop(self):
-        self.running = False
+        self.running = False    
