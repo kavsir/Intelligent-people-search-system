@@ -30,7 +30,10 @@ from operation.ai_pipeline import AIPipeline
 from operation.camera_reader import CameraReader
 from operation.event_logger import EventLogger
 
+from operation.behavior_manager import behavior_manager
 
+shared_logger = EventLogger()
+behavior_manager.start()
 # ---------------------------------------------------------------------------
 # Per-room runtime bundle
 # ---------------------------------------------------------------------------
@@ -358,7 +361,7 @@ def main():
         room.stop()
     for room in rooms:
         room.join()
-
+    behavior_manager.stop()
     shared_logger.close()
     cv2.destroyAllWindows()
     print("[Main] System shut down safely.")

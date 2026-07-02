@@ -32,6 +32,7 @@ import face_database
 from operation.event_logger import EventLogger
 from operation.door_ws_server import DoorWebSocketServer
 from operation.exercise_manager import exercise_manager
+from operation.behavior_manager import behavior_manager
 from app_operation import (
     RoomUnit,
     render_room_panel,
@@ -170,13 +171,19 @@ _cam_to_room = {
 # "cam2"). BOTH doors are driven by a SINGLE physical ESP32 Dev Module
 # board with two servos, multiplexed over one WebSocket connection using
 # a "door" field in every message (see esp32_servo.ino / door_ws_server.py).
-# Each door can only be enabled/toggled based on ITS OWN room's presence;
-# rooms are never allowed to unlock each other's door, even though both
-# doors share the same underlying ESP32 connection.
+#
+# Security model:
+#   - While NOBODY registered is detected anywhere, every door button works
+#     completely normally -- the dashboard can open/close any door freely
+#     on request.
+#   - The MOMENT a registered person is detected (in any room), the whole
+#     system locks down: EVERY door is force-closed automatically, even
+#     doors that were manually opened. Doors never re-open by themselves
+#     after that -- opening always requires a manual button press on the
+#     dashboard, regardless of who's present.
 door_ws = None                  # DoorWebSocketServer, built in start_system()
 _door_lock = threading.Lock()
-_door_enabled = {}              # room_id -> bool (True while THAT room has a confirmed target)
-_door_last_seen_present = {}    # room_id -> time.time() of last confirmed presence
+_door_person_present = {}       # room_id -> bool (True while THAT room has a confirmed target)
 _door_safety_thread = None
 _door_safety_running = False
 
@@ -191,69 +198,79 @@ def _room_registered_present(room_id):
     True if THIS SPECIFIC room currently has a CAMERA-CONFIRMED registered
     target (i.e. its AIPipeline reached TRACKING with a locked identity).
     Deliberately does NOT count InferenceEngine's "inferred presence" in
-    no-cam rooms, and deliberately does NOT look at any OTHER room -- a
-    door only ever unlocks from its own room's real face match.
+    no-cam rooms. Used only to detect the rising edge that triggers a
+    system-wide door lockdown (_lockdown_all_doors) -- it no longer gates
+    whether a door's manual open/close button works.
     """
     with _room_status_lock:
         return _room_has_target.get(room_id, False)
 
 
 def _push_door_status(room_id):
-    """Emit one room's door enable-flag/state/connection to all browsers."""
+    """Emit one room's door state/connection/presence to all browsers."""
     with _door_lock:
-        enabled = _door_enabled.get(room_id, False)
+        person_present = _door_person_present.get(room_id, False)
     state = door_ws.get_state(room_id) if door_ws else "UNKNOWN"
     connected = door_ws.is_connected(room_id) if door_ws else False
     socketio.emit("door_status", {
         "room_id": room_id,
-        "enabled": enabled,
         "state": state,
         "esp32_connected": connected,
+        "person_present": person_present,
     })
+
+
+def _lockdown_all_doors(triggered_by_room_id):
+    """
+    Force-close EVERY door in the system, regardless of which room's
+    camera actually detected the registered person. Called the instant
+    any room transitions from "nobody detected" to "registered person
+    detected". Doors that are already CLOSED (or whose ESP32 isn't
+    connected) are simply skipped.
+    """
+    for room_id in _door_room_ids():
+        if door_ws is None or not door_ws.is_connected(room_id):
+            continue
+        if door_ws.get_state(room_id) == "CLOSED":
+            continue
+
+        if door_ws.send_command(room_id, "CLOSE"):
+            if shared_logger:
+                shared_logger.log(
+                    "DOOR_LOCKDOWN_CLOSED", room=room_id, triggered_by=triggered_by_room_id
+                )
+            _push_door_status(room_id)
 
 
 def _update_door_presence():
     """
-    For EVERY room independently: recompute whether that room's door
-    button should be enabled, push an update to browsers if it changed,
-    and auto-close that room's door if nobody registered has been seen in
-    it for config.DOOR_AUTO_CLOSE_SEC seconds -- a safety net so a door
-    can't be left open indefinitely just because no one pressed 'close'.
+    For EVERY room independently: recompute whether a registered person is
+    currently confirmed present, and push a status update to browsers if
+    it changed. The instant ANY room's presence flips from False -> True,
+    trigger a full system lockdown (every door force-closed) -- see
+    _lockdown_all_doors(). Absence no longer auto-closes anything: with
+    nobody detected, doors are left exactly as the dashboard buttons set
+    them.
     """
-    now = time.time()
-
     for room_id in _door_room_ids():
         present = _room_registered_present(room_id)
 
         with _door_lock:
-            was_enabled = _door_enabled.get(room_id, False)
-            _door_enabled[room_id] = present
-            if present:
-                _door_last_seen_present[room_id] = now
-            since_present = now - _door_last_seen_present.get(room_id, now)
+            was_present = _door_person_present.get(room_id, False)
+            _door_person_present[room_id] = present
 
-        if present != was_enabled:
+        if present != was_present:
             _push_door_status(room_id)
             if shared_logger:
                 shared_logger.log(
-                    "DOOR_ACCESS_ENABLED" if present else "DOOR_ACCESS_DISABLED",
+                    "REGISTERED_PERSON_DETECTED" if present else "REGISTERED_PERSON_CLEARED",
                     room=room_id,
                 )
 
-        timeout = getattr(config, "DOOR_AUTO_CLOSE_SEC", 15)
-        if (
-            timeout > 0
-            and not present
-            and since_present >= timeout
-            and door_ws is not None
-            and door_ws.get_state(room_id) == "OPEN"
-        ):
-            if door_ws.send_command(room_id, "CLOSE"):
-                if shared_logger:
-                    shared_logger.log(
-                        "DOOR_AUTO_CLOSED", room=room_id, after_sec=round(since_present, 1)
-                    )
-                _push_door_status(room_id)
+        if present and not was_present:
+            # Rising edge: a registered person was just detected in this
+            # room -- lock down every door in the system.
+            _lockdown_all_doors(triggered_by_room_id=room_id)
 
 
 def _door_safety_loop():
@@ -287,6 +304,8 @@ def _on_exercise_fail(name):
         if room.ai_thread.get_locked_identity() == name:
             room.ai_thread.force_clear_target()
 
+    behavior_manager.forget(name)
+
     if shared_logger:
         shared_logger.log("EXERCISE_FAILED_DELETED", name=name)
 
@@ -312,13 +331,18 @@ def start_system():
 
     exercise_manager.set_on_fail_callback(_on_exercise_fail)
 
+    # Behavior recognition (Đứng/Di chuyển/Nhảy/Giơ tay/Nằm/squat/hít đất):
+    # starts the background thread that snapshots every registered
+    # person's running counts into face_database.behavior_log every
+    # config.BEHAVIOR_SNAPSHOT_INTERVAL_SEC seconds.
+    behavior_manager.start()
+
     # --- Door WebSocket server: ONE physical ESP32 (Dev Module, 2 servos)
     # connects IN to us as a single WebSocket client, and multiplexes
     # BOTH doors' commands/states over that one connection using a
     # "door" field per message (door id == the room's camera id). ---
     for room_id in _door_room_ids():
-        _door_enabled[room_id] = False
-        _door_last_seen_present[room_id] = time.time()
+        _door_person_present[room_id] = False
 
     def _on_door_state_change(room_id, state, connected):
         # Called from the DoorWS asyncio thread. _push_door_status() only
@@ -357,6 +381,7 @@ def stop_system():
     global _door_safety_running
     print("\n[Main] Stopping all camera/AI threads...")
     _door_safety_running = False
+    behavior_manager.stop()
     for room in rooms:
         room.stop()
     for room in rooms:
@@ -564,25 +589,26 @@ def handle_connect():
     change in some room."""
     for room_id in _door_room_ids():
         with _door_lock:
-            enabled = _door_enabled.get(room_id, False)
+            person_present = _door_person_present.get(room_id, False)
         state = door_ws.get_state(room_id) if door_ws else "UNKNOWN"
         connected = door_ws.is_connected(room_id) if door_ws else False
         emit("door_status", {
             "room_id": room_id,
-            "enabled": enabled,
             "state": state,
             "esp32_connected": connected,
+            "person_present": person_present,
         })
 
 
 @socketio.on("toggle_door")
 def handle_toggle_door(data):
     """
-    Browser asked to open/close ONE SPECIFIC room's door. We re-check that
-    room's presence server-side -- never trust that the button was
-    actually disabled client-side -- and toggle relative to that room's
-    ESP32's last known real state. A room's presence can NEVER be used to
-    toggle another room's door.
+    Browser asked to open/close ONE SPECIFIC room's door. Manual open/close
+    is always allowed (no presence gate) -- a room's door only ever gets
+    force-closed automatically by _lockdown_all_doors() the moment a
+    registered person is detected somewhere; the button itself works
+    regardless of presence. A room's request can NEVER toggle another
+    room's door.
     """
     room_id = (data or {}).get("room_id")
     if not room_id or room_id not in _door_room_ids():
@@ -590,14 +616,6 @@ def handle_toggle_door(data):
             "room_id": room_id,
             "status": "error",
             "message": "Phòng không hợp lệ.",
-        })
-        return
-
-    if not _room_registered_present(room_id):
-        emit("door_response", {
-            "room_id": room_id,
-            "status": "error",
-            "message": "Không phát hiện người đã đăng ký trong phòng này.",
         })
         return
 
@@ -690,6 +708,35 @@ def delete_exercise_row(name):
 
 
 # ---------------------------------------------------------------------------
+# Behavior recognition API (Đứng / Di chuyển / Nhảy / Giơ tay / Nằm / squat /
+# hít đất) -- see operation/behavior_manager.py + face_database.behavior_log
+# ---------------------------------------------------------------------------
+@app.route("/api/behaviors")
+def get_behaviors():
+    """
+    Live table: one row per person who has triggered at least one
+    behavior event since the system started, with their running totals
+    for each of the 7 columns. Updates every frame (not throttled to the
+    5s DB snapshot) -- good for a live-updating dashboard table.
+    """
+    return jsonify({"rows": behavior_manager.get_table()})
+
+
+@app.route("/api/behaviors/history")
+def get_behaviors_history():
+    """
+    Time-stamped snapshot history for ONE person (?name=..&limit=..),
+    written every config.BEHAVIOR_SNAPSHOT_INTERVAL_SEC seconds to
+    face_database.behavior_log -- e.g. for an activity-over-time chart.
+    """
+    name = (request.args.get("name") or "").strip()
+    if not name:
+        return jsonify({"status": "error", "message": "Thiếu tham số 'name'."}), 400
+    limit = int(request.args.get("limit", 200))
+    return jsonify({"name": name, "history": face_database.get_behavior_history(name, limit=limit)})
+
+
+# ---------------------------------------------------------------------------
 # People overview page -- combined view of every registered person: which
 # room they're currently seen in, that room's door status, and their
 # exercise assignment/progress/result.
@@ -723,13 +770,13 @@ def people_overview():
         room_obj = _room_lookup_by_cam_id(room_id) if room_id else None
 
         door_state = "UNKNOWN"
-        door_enabled = False
+        person_present = False
         door_connected = False
         if room_obj is not None:
             door_state = door_ws.get_state(room_id) if door_ws else "UNKNOWN"
             door_connected = door_ws.is_connected(room_id) if door_ws else False
             with _door_lock:
-                door_enabled = _door_enabled.get(room_id, False)
+                person_present = _door_person_present.get(room_id, False)
 
         ex = exercise_by_name.get(name)
 
@@ -737,8 +784,8 @@ def people_overview():
             "name": name,
             "room_id": room_id,
             "room_name": room_obj.room_name if room_obj else None,
-            "door_state": door_state,       # "OPEN" | "CLOSED" | "UNKNOWN"
-            "door_enabled": door_enabled,    # this room's presence-gate flag
+            "door_state": door_state,           # "OPEN" | "CLOSED" | "UNKNOWN"
+            "person_present": person_present,   # this room currently has a confirmed target
             "door_connected": door_connected,
             "assigned": ex is not None,
             "exercise": ex["exercise"] if ex else None,           # "squat" | "pushup" | None

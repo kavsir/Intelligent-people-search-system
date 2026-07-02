@@ -8,30 +8,30 @@ const MAX_TIMELINE = 80;
 const socket = io();
 
 // ── Door state -- one entry per room, each door is fully independent ────────
-// roomId -> { enabled: bool, state: 'OPEN'|'CLOSED'|'UNKNOWN' }
+// roomId -> { state: 'OPEN'|'CLOSED'|'UNKNOWN', personPresent: bool }
 let doorStates = {};
 
 // ── Update ONE room's door UI ───────────────────────────────────────────
-function updateDoorUI(roomId, enabled, state) {
-  doorStates[roomId] = { enabled, state: state || 'UNKNOWN' };
+// The button is ALWAYS clickable, regardless of presence: with nobody
+// detected it opens/closes on request; the moment a registered person is
+// detected anywhere, the server force-closes every door automatically, and
+// this same button is how you open it back up again manually.
+function updateDoorUI(roomId, state, personPresent) {
+  doorStates[roomId] = { state: state || 'UNKNOWN', personPresent: !!personPresent };
 
   const doorBtn = document.getElementById('doorBtn-' + roomId);
   const doorStatusText = document.getElementById('doorStatusText-' + roomId);
   if (!doorBtn || !doorStatusText) return;  // this room's door card isn't in the DOM (yet)
 
   // Button label reflects the ACTION it will perform next, based on the
-  // ESP32's real door state -- not just whether it's clickable.
+  // ESP32's real door state.
   //   CLOSED/UNKNOWN -> "Mở cửa" (will OPEN)
   //   OPEN           -> "Đóng cửa" (will CLOSE)
   const willOpen = state !== 'OPEN';
   const label = willOpen ? 'Mở cửa' : 'Đóng cửa';
-  const icon = willOpen ? (enabled ? '🔓' : '🔒') : '🔐';
+  const icon = willOpen ? '🔓' : '🔐';
 
-  if (enabled) {
-    doorBtn.classList.add('enabled');
-  } else {
-    doorBtn.classList.remove('enabled');
-  }
+  doorBtn.classList.add('enabled');  // always clickable
   doorBtn.textContent = `${icon} ${label}`;
 
   // Update status text
@@ -40,13 +40,12 @@ function updateDoorUI(roomId, enabled, state) {
     doorStatusText.textContent = '🔓 Đang mở';
     doorStatusText.classList.add('open');
   } else if (state === 'CLOSED') {
-    doorStatusText.textContent = '🔒 Đã đóng';
+    doorStatusText.textContent = personPresent
+      ? '🔒 Đã khóa (phát hiện người)'
+      : '🔒 Đã đóng';
     doorStatusText.classList.add('closed');
-  } else if (enabled) {
-    doorStatusText.textContent = '✅ Sẵn sàng';
-    doorStatusText.classList.add('open');
   } else {
-    doorStatusText.textContent = '⛔ Không có người đăng ký';
+    doorStatusText.textContent = '⏳ Không rõ trạng thái';
     doorStatusText.classList.add('unknown');
   }
 }
@@ -58,7 +57,7 @@ socket.on('connect', function() {
 
 socket.on('door_status', function(data) {
   console.log('[WebSocket] Door status:', data);
-  updateDoorUI(data.room_id, data.enabled, data.state);
+  updateDoorUI(data.room_id, data.state, data.person_present);
 });
 
 socket.on('door_response', function(data) {
@@ -70,9 +69,9 @@ socket.on('door_response', function(data) {
 });
 
 // ── Door button click -- always sends WHICH room's door was pressed ─────
+// The button is always active: manual open/close works regardless of
+// presence. The server may still reject it (e.g. ESP32 not connected).
 function toggleDoor(roomId) {
-  const st = doorStates[roomId];
-  if (!st || !st.enabled) return;
   socket.emit('toggle_door', { room_id: roomId });
 }
 
@@ -400,7 +399,6 @@ async function pollStatus() {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 (async () => {
-  await fetchConfig();
   await pollStatus();
   await pollTimeline();
   await loadRegisteredPeople();

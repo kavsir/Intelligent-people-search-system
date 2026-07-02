@@ -8,7 +8,7 @@ const char* ssid     = "seele";
 const char* password = "0123456789.";
 
 // ---- Server running app_dashboard.py / door_ws_server.py ----
-const char* ws_host = "10.248.162.207";   // <-- SET THIS to your server's LAN IP
+const char* ws_host = "10.153.15.207";   // <-- SET THIS to your server's LAN IP
 const uint16_t ws_port = 8765;         // must match config.DOOR_WS_PORT
 const char* ws_path = "/";
 
