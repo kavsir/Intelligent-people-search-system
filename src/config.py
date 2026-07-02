@@ -64,29 +64,53 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
+# Legacy "labeled folders" dataset layout. No longer written to -- kept
+# only so migrate_to_sqlite.py can read the old data once and import it
+# into FACE_DB_PATH below. Safe to delete these folders after migrating.
 FACE_DB_DIR = os.path.join(DATA_DIR, "face_db")
 PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
 
+# Current dataset storage: a single SQLite file holding every registered
+# person's embeddings + raw/processed images. See face_database.py.
+FACE_DB_PATH = os.path.join(DATA_DIR, "face_dataset.db")
+
 # ---------------------------------------------------------------------------
-# Cameras (ESP32-CAM MJPEG streams)
+# Door servo ESP32 (Dev Module) -- WebSocket
 # ---------------------------------------------------------------------------
-# Each ESP32-CAM streams MJPEG directly to this machine (no longer routed
-# through the ESP32-S3, which now only acts as a coordination gateway over
-# HTTP/MQTT to tell each ESP32-CAM when to stream/snapshot/sleep).
-#
-# Cameras are fixed-position (no pan/tilt servo). Each one only detects and
-# recognizes whoever is in its own room; there is no mechanism that moves
-# the camera to follow a person.
+# ONE physical ESP32 Dev Module drives BOTH door servos (Phòng 1 + Phòng 2)
+# and connects IN to this server as a single WebSocket *client* (see
+# operation/door_ws_server.py and esp32_servo.ino). Each door/room is
+# addressed by the same id as its entry in CAMERAS (e.g. "cam1", "cam2"),
+# multiplexed over that one connection -- we don't need to know the
+# ESP32's IP, we just bind and listen here.
+# ---------------------------------------------------------------------------
+# Cross-app links
+# ---------------------------------------------------------------------------
+# Port app_registration.py listens on (see its `app.run(..., port=...)`).
+# app_dashboard.py exposes this via /api/config so dashboard.html can build
+# a working "Đăng ký khuôn mặt" link regardless of which host/IP the
+# dashboard is being viewed from.
+REGISTRATION_APP_PORT = 5000
+
+DOOR_WS_HOST = "0.0.0.0"   # interface the door WebSocket server binds to
+DOOR_WS_PORT = 8765        # must match `ws_port` in esp32_servo.ino
+
+# Seconds with NO registered person seen in a room before THAT room's door
+# is force-closed automatically, even if nobody pressed its dashboard
+# button. Safety net so a door is never left open indefinitely. Applies
+# independently per room/door. 0 disables it.
+DOOR_AUTO_CLOSE_SEC = 15
+
 CAMERAS = [
     {
         "id": "cam1",
         "room_name": "Phong 1",
-        "url": "http://192.168.0.10/stream",
+        "url": "http://10.248.162.227/stream",
     },
     {
         "id": "cam2",
         "room_name": "Phong 2",
-        "url": "http://192.168.0.11/stream",
+        "url": "http:///stream",
     },
 ]
 
@@ -114,7 +138,7 @@ AI_CONF_THRESHOLD = 0.5
 # detected face to be considered a match for a registered person. Lower this
 # (e.g. 0.4) if recognition feels too strict; raise it if strangers are
 # getting matched to a registered name.
-FACE_RECOGNITION_THRESHOLD = 0.5
+FACE_RECOGNITION_THRESHOLD = 0.35
 
 # How many AI-pipeline steps to wait between identity re-checks while a face
 # is already locked and tracked by CSRT. Identity doesn't need to be
@@ -129,6 +153,32 @@ IDENTITY_RECHECK_INTERVAL = 10
 # actually declares the target lost. Prevents 1-2 frame detection hiccups
 # from flapping the state back and forth.
 LOST_GRACE_PERIOD_SEC = 1.0
+
+# ---------------------------------------------------------------------------
+# CPU load / latency tuning
+# ---------------------------------------------------------------------------
+# Running multiple AIPipeline threads (one per camera) on CPU means they
+# compete for the same cores -- YOLO-face/YOLO-person/InsightFace are all
+# heavy enough that running 2+ at once noticeably slows each one down.
+# These knobs reduce wasted CPU time without changing input resolution or
+# detection accuracy.
+
+# In SEARCHING, how many pipeline steps to skip between YOLO-face calls.
+# 0 = run every step (old behavior). 2 means: run on step 0, skip steps 1
+# and 2, run again on step 3, etc. -- roughly a 1/3 reduction in CPU spent
+# on face detection while still scanning often enough that a newly-arrived
+# registered person is found within a fraction of a second, not noticeably
+# slower from a user's point of view.
+SEARCHING_SKIP_FRAMES = 2
+
+# Fixed delay (seconds) at the end of every pipeline step, applied only
+# when the step itself was fast. If a step already took a while (because
+# the CPU was busy with the other camera's thread), this sleep is skipped
+# entirely instead of stacking on top of an already-slow frame. This
+# replaces a flat time.sleep(0.01) that fired unconditionally even when
+# the CPU had no time to spare.
+STEP_SLEEP_SEC = 0.01
+STEP_SLEEP_SKIP_IF_STEP_TOOK_LONGER_THAN_SEC = 0.03
 
 # ---------------------------------------------------------------------------
 # Floor plan & inferred presence

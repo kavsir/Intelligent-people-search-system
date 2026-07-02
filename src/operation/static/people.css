@@ -1,0 +1,83 @@
+/* Extends dashboard.css's :root variables (loaded first in people.html) */
+
+.people-section {
+  max-width: 1100px;
+  margin: 0 auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.people-table-wrap { overflow-x: auto; }
+
+.people-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.people-table th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.people-table td {
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.people-table tbody tr:hover { background: var(--surface2); }
+
+.pp-empty { text-align: center; color: var(--muted); padding: 18px; white-space: normal; }
+
+.pp-name { font-weight: 700; }
+
+.pp-room { color: var(--text); }
+.pp-room.pp-dash { color: var(--muted); }
+
+/* Door status pill */
+.pp-door {
+  font-size: 10px; padding: 3px 9px; border-radius: 999px; font-weight: 700;
+  display: inline-block;
+}
+.pp-door-open    { background: rgba(34,197,94,.2);  color: var(--green); }
+.pp-door-closed  { background: rgba(100,116,139,.2); color: var(--muted); }
+.pp-door-unknown { background: rgba(249,115,22,.2); color: var(--orange); }
+
+/* Exercise / activity cell */
+.pp-activity { display: flex; align-items: center; gap: 6px; }
+.pp-activity-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+.pp-activity-dot.on { background: var(--green); box-shadow: 0 0 5px var(--green); }
+
+/* Reps */
+.pp-reps { font-variant-numeric: tabular-nums; color: var(--text); }
+.pp-reps .pp-target { color: var(--muted); }
+
+/* Online/offline status badge (this is the live tracking status) */
+.pp-status {
+  font-size: 10px; padding: 3px 9px; border-radius: 999px; font-weight: 700;
+  display: inline-block;
+}
+.pp-status-online  { background: rgba(34,197,94,.2);  color: var(--green); }
+.pp-status-offline { background: rgba(100,116,139,.2); color: var(--muted); }
+
+/* Final result badge */
+.pp-result {
+  font-size: 10px; padding: 3px 9px; border-radius: 999px; font-weight: 700;
+  display: inline-block;
+}
+.pp-result-success { background: rgba(34,197,94,.2);  color: var(--green); }
+.pp-result-fail     { background: rgba(239,68,68,.2);  color: var(--red); }
+.pp-result-pending  { background: rgba(59,130,246,.2); color: var(--blue); }
+.pp-result-none     { background: rgba(100,116,139,.15); color: var(--muted); }
+
+#people-status-bar {
+  margin-top: 12px; font-size: 11px; color: var(--muted);
+}

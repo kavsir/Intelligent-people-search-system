@@ -1,32 +1,11 @@
 """
-AI tracking pipeline: a finite state machine that prioritizes face tracking
-(cheap CSRT tracker, periodically re-validated by YOLO-face) and falls back
-to person tracking (YOLO-person) when the face is lost.
-
-Unlike the first version of this file, this pipeline only locks onto a
-*registered* person (matched via FaceRecognizer against data/face_db/) --
-an unrecognized face is reported but never tracked. This is what connects
-the registration app's output to the operation app, which was previously
-missing entirely.
-
-States:
-    SEARCHING       -> no locked target yet, scanning every frame
-    TRACKING_FACE   -> locked onto a registered face, tracked via CSRT
-    FALLBACK_PERSON -> face lost, tracking the same person's body instead
-    LOST            -> target missing for longer than the grace period;
-                       last known bbox/center is simply discarded (cameras
-                       are fixed-position, so nothing needs to "hold")
-
-IGNORE is not a separate FSM state here -- it's simply what happens when a
-detected face does not match anyone in face_db: it's logged but ignored,
-and the FSM stays in SEARCHING.
+AI tracking pipeline – ổn định target, hiển thị tất cả khuôn mặt đã đăng ký.
 """
 
 import os
 import sys
 import threading
 import time
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -35,11 +14,27 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from operation.event_logger import EventLogger
 from operation.face_recognizer import FaceRecognizer
+from operation.pose_estimator import PoseEstimator
+from operation.exercise_manager import exercise_manager
+
+
+def _bbox_iou(a, b):
+    """Intersection-over-union of two [x1,y1,x2,y2] boxes."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
 
 
 class KalmanFilter2D:
-    """Simple constant-velocity 2D Kalman filter used to smooth target center."""
-
     def __init__(self):
         self.kf = cv2.KalmanFilter(4, 2, 0)
         self.kf.transitionMatrix = np.array(
@@ -55,7 +50,6 @@ class KalmanFilter2D:
         if not self.initialized:
             self.kf.statePost = np.array([[cx], [cy], [0], [0]], np.float32)
             self.initialized = True
-
         meas = np.array([[np.float32(cx)], [np.float32(cy)]], np.float32)
         self.kf.predict()
         corrected = self.kf.correct(meas)
@@ -66,7 +60,6 @@ class KalmanFilter2D:
 
 
 def _crop_safe(frame, bbox):
-    """Crop a bbox out of frame, clamped to image bounds. Returns None if empty."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = bbox
     x1, y1 = max(0, int(x1)), max(0, int(y1))
@@ -82,131 +75,99 @@ class AIPipeline(threading.Thread):
         self.camera_thread = camera_thread
         self.running = True
         self.daemon = True
-
-        # Used to tag every log line / print statement so that, when several
-        # AIPipeline instances run in parallel (one per physical camera /
-        # room), it's clear which camera a given event came from.
         self.room_name = room_name
-
         self.logger = event_logger or EventLogger()
 
-        # --- Load models ---
-        print("[AI] Loading AI models...")
         self.device = config.get_torch_device()
-        print(f"[AI:{self.room_name}] YOLO models running on {self.device.upper()}.")
+        print(f"[AI:{self.room_name}] YOLO running on {self.device.upper()}.")
+        self.yolo_face = YOLO(config.YOLO_FACE_MODEL_PATH)
+        if not os.path.exists(config.YOLO_FACE_MODEL_PATH):
+            print(f"[AI:{self.room_name}] WARNING: face model not found, using person model.")
+            self.yolo_face = YOLO(config.YOLO_PERSON_MODEL_PATH)
 
+        # Used only as a fallback in TRACKING when the locked person's
+        # face can no longer be recognized (too far / bad angle) -- lets
+        # us keep the lock on their BODY instead of losing them outright,
+        # and is also what feeds the exercise pose estimator.
         self.yolo_person = YOLO(config.YOLO_PERSON_MODEL_PATH)
-        try:
-            self.yolo_face = YOLO(config.YOLO_FACE_MODEL_PATH)
-            self._face_model_ok = True
-        except Exception:
-            print(
-                "[AI] WARNING: face model not found at "
-                f"{config.YOLO_FACE_MODEL_PATH}. Falling back to the person "
-                "model for face detection -- face tracking will NOT work "
-                "correctly until yolov8n-face.pt is in place (see "
-                "download_model.py)."
-            )
-            self.yolo_face = self.yolo_person
-            self._face_model_ok = False
 
         self.recognizer = FaceRecognizer()
         self.recognizer.load_database()
         if self.recognizer.is_empty():
-            print(
-                "[AI] WARNING: face_db is empty. No registered person can be "
-                "tracked until at least one person is registered via the "
-                "registration app."
-            )
+            print(f"[AI:{self.room_name}] WARNING: face_db empty.")
+
+        # One PoseEstimator per room (mediapipe Pose objects are not
+        # thread-safe, so this must never be shared across AIPipeline
+        # threads).
+        self.pose_estimator = PoseEstimator()
 
         self.kalman = KalmanFilter2D()
 
-        # --- Finite state machine ---
+        # FSM
         self.STATE_SEARCHING = "SEARCHING"
-        self.STATE_TRACKING_FACE = "TRACKING_FACE"
-        self.STATE_FALLBACK_PERSON = "FALLBACK_PERSON"
+        self.STATE_TRACKING = "TRACKING"
         self.STATE_LOST = "LOST"
         self.current_state = self.STATE_SEARCHING
 
-        # --- Classic tracker (CSRT) ---
-        self.tracker = None
-        self.validate_counter = 0
-        self.VALIDATE_INTERVAL = 20  # re-run YOLO every N frames to correct drift
+        # Target chính
+        self.locked_identity = None
+        self.target_bbox = None
+        self.target_center = None
+        # "FACE" while the locked person's face is still recognizable each
+        # frame, "BODY" while we're keeping the lock via YOLO-person + IOU
+        # continuity because their face faded out (they walked further
+        # away) but they haven't actually left the frame.
+        self.lock_mode = None
 
-        # Frame counter used to throttle the face re-check while in fallback,
-        # instead of relying on wall-clock time (which is non-deterministic
-        # with respect to the loop).
-        self.fallback_face_check_counter = 0
-        self.FALLBACK_FACE_CHECK_INTERVAL = 3
+        # Tất cả khuôn mặt đã đăng ký trong frame hiện tại
+        self.all_faces = []   # list of dict {name, bbox, score, center}
 
-        # --- Identity tracking ---
-        self.locked_identity = None  # name of the person currently locked on
+        # Đếm frame mất target liên tục (để chuyển sang LOST)
+        self.lost_counter = 0
+        self.LOST_THRESHOLD = 10   # 10 frame mất -> coi là lost
 
-        # --- Lost-target debounce (avoids 1-2 frame flicker flapping state) ---
-        self.LOST_GRACE_PERIOD_SEC = config.LOST_GRACE_PERIOD_SEC
-        self._target_missing_since = None
-
-        # --- Output state (protected by _lock since the dashboard thread(s)
-        # read it concurrently with this thread writing it) ---
+        # Output lock
         self._lock = threading.Lock()
         self.has_target = False
         self.raw_bbox = None
         self.smoothed_bbox = None
-        self.target_center = None
+        self.smoothed_center = None
         self.last_step_latency_ms = 0.0
+        self.last_detect_ms = 0.0
+        self.last_recognize_ms = 0.0
 
-    # -----------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------
-    def _init_csrt_tracker(self, frame, bbox):
-        """(Re)initialize the OpenCV CSRT tracker on the given bbox."""
-        try:
-            self.tracker = cv2.TrackerCSRT_create()
-        except AttributeError:
-            self.tracker = cv2.TrackerCSRT.create()
-
-        x1, y1, x2, y2 = bbox
-        w, h = x2 - x1, y2 - y1
-        self.tracker.init(frame, (x1, y1, w, h))
-        self.validate_counter = 0
-
-    def _set_output(self, has_target, raw_bbox, smoothed_bbox, target_center):
+    def _set_output(self, has_target, raw_bbox, smoothed_bbox, center):
         with self._lock:
             self.has_target = has_target
             self.raw_bbox = raw_bbox
             self.smoothed_bbox = smoothed_bbox
-            self.target_center = target_center
+            self.smoothed_center = center
 
-    def _clear_target(self, reset_kalman=True):
+    def _clear_target(self):
+        self.locked_identity = None
+        self.target_bbox = None
+        self.target_center = None
+        self.lock_mode = None
+        self.kalman.reset()
         self._set_output(False, None, None, None)
-        if reset_kalman:
-            self.kalman.reset()
 
-    def _mark_target_seen(self):
-        """Call whenever a locked target is successfully found this frame."""
-        self._target_missing_since = None
-
-    def _mark_target_missing_and_check_lost(self):
+    def force_clear_target(self):
         """
-        Call when the locked target could not be found this frame.
-        Returns True once the grace period has elapsed (caller should then
-        transition to LOST); returns False while still within the grace
-        period (caller should leave the last known output untouched so the
-        dashboard doesn't flicker the bbox off for a 1-2 frame hiccup).
+        Thread-safe external request to drop whatever this room is
+        currently locked onto and go back to SEARCHING. Used when the
+        locked person's registration data was just deleted (they failed
+        an assigned exercise), so we stop tracking someone who no longer
+        exists in face_db.
         """
-        now = time.time()
-        if self._target_missing_since is None:
-            self._target_missing_since = now
-            return False
+        self.current_state = self.STATE_SEARCHING
+        self._clear_target()
 
-        return (now - self._target_missing_since) >= self.LOST_GRACE_PERIOD_SEC
+    def get_lock_mode(self):
+        return self.lock_mode
 
-    # -----------------------------------------------------------------
-    # Thread main loop
-    # -----------------------------------------------------------------
     def run(self):
-        print(f"[AI:{self.room_name}] FSM thread started. Initial state: {self.current_state}")
-        self.logger.log("PIPELINE_STARTED", state=self.current_state, room=self.room_name)
+        print(f"[AI:{self.room_name}] FSM started.")
+        self.logger.log("PIPELINE_STARTED", room=self.room_name)
 
         while self.running:
             ret, frame = self.camera_thread.get_frame()
@@ -217,245 +178,296 @@ class AIPipeline(threading.Thread):
             step_start = time.time()
             try:
                 self._step(frame)
-            except Exception as exc:
-                # Never let a single bad frame kill the whole AI thread.
-                print(f"[AI:{self.room_name}] Unexpected error during step, resetting to SEARCHING: {exc}")
-                self.logger.log("PIPELINE_ERROR", error=str(exc), room=self.room_name)
+            except Exception as e:
+                print(f"[AI:{self.room_name}] Error: {e}, resetting.")
+                self.logger.log("PIPELINE_ERROR", error=str(e), room=self.room_name)
                 self.current_state = self.STATE_SEARCHING
-                self.tracker = None
-                self.locked_identity = None
-                self._target_missing_since = None
                 self._clear_target()
 
             with self._lock:
                 self.last_step_latency_ms = (time.time() - step_start) * 1000.0
-
             time.sleep(0.01)
 
     def _step(self, frame):
         if self.current_state == self.STATE_SEARCHING:
             self._step_searching(frame)
-        elif self.current_state == self.STATE_TRACKING_FACE:
-            self._step_tracking_face(frame)
-        elif self.current_state == self.STATE_FALLBACK_PERSON:
-            self._step_fallback_person(frame)
+        elif self.current_state == self.STATE_TRACKING:
+            self._step_tracking(frame)
         elif self.current_state == self.STATE_LOST:
             self._step_lost(frame)
 
-    # -----------------------------------------------------------------
-    # State: SEARCHING
-    # -----------------------------------------------------------------
+    # =============================================
+    # SEARCHING
+    # =============================================
     def _step_searching(self, frame):
-        face_results = self.yolo_face(frame, verbose=False, device=self.device)
+        detect_start = time.time()
+        results = self.yolo_face(frame, verbose=False, device=self.device)
+        detect_ms = (time.time() - detect_start) * 1000.0
 
-        for r in face_results:
+        candidates = []   # (bbox, name, score, center)
+        all_faces = []
+
+        recognize_start = time.time()
+        for r in results:
             for box in r.boxes:
                 xyxy = box.xyxy[0].cpu().numpy().astype(int)
                 crop = _crop_safe(frame, xyxy)
-                name, score = self.recognizer.identify(crop)
-
-                if name is None:
-                    # Either nobody is registered, or this face doesn't match
-                    # anyone registered closely enough -- log once and move
-                    # on without locking onto a stranger.
-                    self.logger.log("FACE_IGNORED", score=f"{score:.2f}", room=self.room_name)
+                if crop is None:
                     continue
-
-                self.raw_bbox = list(xyxy)
-                self.locked_identity = name
-                self.current_state = self.STATE_TRACKING_FACE
-                self._target_missing_since = None
-                self._init_csrt_tracker(frame, self.raw_bbox)
-                self.logger.log(
-                    "TARGET_ACQUIRED", name=name, score=f"{score:.2f}", mode="FACE_TRACK", room=self.room_name
-                )
-                print(f"[FSM:{self.room_name}] Recognized '{name}' (score={score:.2f}) -> TRACKING_FACE")
-                return
-
-        # No registered face found this frame.
-        self._clear_target(reset_kalman=False)
-
-    # -----------------------------------------------------------------
-    # State: TRACKING_FACE
-    # -----------------------------------------------------------------
-    def _step_tracking_face(self, frame):
-        self.validate_counter += 1
-
-        success, tracker_box = self.tracker.update(frame)
-
-        if not success:
-            self._handle_face_track_failure(reason="CSRT lost the face")
-            return
-
-        tx, ty, tw, th = map(int, tracker_box)
-        smoothed_bbox = [tx, ty, tx + tw, ty + th]
-
-        raw_cx, raw_cy = tx + tw // 2, ty + th // 2
-        kx, ky = self.kalman.predict_and_correct(raw_cx, raw_cy)
-
-        self._mark_target_seen()
-        self._set_output(True, self.raw_bbox, smoothed_bbox, (kx, ky))
-
-        if self.validate_counter >= self.VALIDATE_INTERVAL:
-            self.validate_counter = 0
-            self._revalidate_face_identity(frame)
-
-    def _revalidate_face_identity(self, frame):
-        """
-        Periodically re-run YOLO-face + recognition to correct CSRT drift and
-        confirm we're still tracking the same registered person (not someone
-        who has since walked into the CSRT box).
-        """
-        face_results = self.yolo_face(frame, verbose=False, device=self.device)
-
-        for r in face_results:
-            for box in r.boxes:
-                xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                crop = _crop_safe(frame, xyxy)
                 name, score = self.recognizer.identify(crop)
+                if name is not None:
+                    cx = (xyxy[0] + xyxy[2]) // 2
+                    cy = (xyxy[1] + xyxy[3]) // 2
+                    center = (cx, cy)
+                    candidates.append((xyxy, name, score, center))
+                    all_faces.append({
+                        "name": name,
+                        "bbox": xyxy.tolist(),
+                        "score": score,
+                        "center": center
+                    })
+        recognize_ms = (time.time() - recognize_start) * 1000.0
+        self.last_detect_ms = detect_ms
+        self.last_recognize_ms = recognize_ms
 
-                if name != self.locked_identity:
-                    continue
-
-                self.raw_bbox = list(xyxy)
-                self._init_csrt_tracker(frame, self.raw_bbox)
-                return
-
-        self._handle_face_track_failure(
-            reason="re-check found no face matching the locked identity"
-        )
-
-    def _handle_face_track_failure(self, reason):
-        print(f"[FSM:{self.room_name}] {reason} -> trying FALLBACK_PERSON")
-        self.logger.log("FACE_TRACK_LOST", reason=reason, name=self.locked_identity, room=self.room_name)
-        self.current_state = self.STATE_FALLBACK_PERSON
-        self.fallback_face_check_counter = 0
-
-    # -----------------------------------------------------------------
-    # State: FALLBACK_PERSON
-    # -----------------------------------------------------------------
-    def _step_fallback_person(self, frame):
-        person_results = self.yolo_person(frame, verbose=False, device=self.device)
-        person_found = False
-
-        for r in person_results:
-            person_boxes = [
-                b for b in r.boxes if self.yolo_person.names[int(b.cls[0])] == "person"
-            ]
-            if len(person_boxes) == 0:
-                continue
-
-            px1, py1, px2, py2 = person_boxes[0].xyxy[0].cpu().numpy().astype(int)
-            raw_bbox = [px1, py1, px2, py2]
-            person_found = True
-
-            body_cx = px1 + (px2 - px1) // 2
-            body_cy = py1 + (py2 - py1) // 4  # bias toward chest/head, not navel
-
-            kx, ky = self.kalman.predict_and_correct(body_cx, body_cy)
-            self._mark_target_seen()
-            self._set_output(True, raw_bbox, raw_bbox, (kx, ky))
-
-            # Periodically re-check for the registered face within the
-            # person box, using a frame counter rather than wall-clock time
-            # for a deterministic 1-in-N check rate.
-            self.fallback_face_check_counter += 1
-            if self.fallback_face_check_counter >= self.FALLBACK_FACE_CHECK_INTERVAL:
-                self.fallback_face_check_counter = 0
-                if self._try_reacquire_face(frame):
-                    return
-            break
-
-        if not person_found:
-            self._handle_target_missing(reason="lost person in FALLBACK_PERSON")
-
-    def _try_reacquire_face(self, frame):
-        """Look for the locked identity's face again; switch back to
-        TRACKING_FACE if found. Returns True if reacquired."""
-        face_results = self.yolo_face(frame, verbose=False, device=self.device)
-
-        for fr in face_results:
-            for box in fr.boxes:
-                fbox = box.xyxy[0].cpu().numpy().astype(int)
-                crop = _crop_safe(frame, fbox)
-                name, score = self.recognizer.identify(crop)
-
-                if name != self.locked_identity:
-                    continue
-
-                self.raw_bbox = list(fbox)
-                self._init_csrt_tracker(frame, self.raw_bbox)
-                self.current_state = self.STATE_TRACKING_FACE
-                self.logger.log("FACE_REACQUIRED", name=name, score=f"{score:.2f}", room=self.room_name)
-                print(f"[FSM:{self.room_name}] Face reacquired for '{name}' -> TRACKING_FACE")
-                return True
-
-        return False
-
-    # -----------------------------------------------------------------
-    # State: LOST
-    # -----------------------------------------------------------------
-    def _step_lost(self, frame):
-        """
-        Target has been missing longer than the grace period. has_target
-        is now False, so the dashboard simply shows no bbox/center. Keep
-        scanning for the registered face so we can recover automatically
-        without operator intervention.
-        """
-        if self._try_reacquire_face(frame):
-            self._mark_target_seen()
-            self.logger.log("TARGET_REACQUIRED", name=self.locked_identity, room=self.room_name)
-            return
-
-        # Stay in LOST; output already reflects "no target" (set in
-        # _handle_target_missing right before transitioning here).
-
-    # -----------------------------------------------------------------
-    # Shared "target missing" handling with debounce
-    # -----------------------------------------------------------------
-    def _handle_target_missing(self, reason):
-        should_declare_lost = self._mark_target_missing_and_check_lost()
-
-        if not should_declare_lost:
-            # Still within the grace period: don't touch has_target/target
-            # output -- the dashboard simply keeps showing the last known
-            # position for a moment, instead of snapping to "no target" on
-            # a single dropped frame.
-            return
-
-        print(f"[FSM:{self.room_name}] {reason}, grace period elapsed -> LOST")
-        self.logger.log("TARGET_LOST", name=self.locked_identity, reason=reason, room=self.room_name)
-        self.current_state = self.STATE_LOST
-        self.tracker = None
-        self._clear_target(reset_kalman=True)
-
-    # -----------------------------------------------------------------
-    # Public accessors
-    # -----------------------------------------------------------------
-    def get_ai_result(self):
-        """Return (has_target, raw_bbox, smoothed_bbox, target_center, state)."""
         with self._lock:
-            return (
-                self.has_target,
-                self.raw_bbox,
-                self.smoothed_bbox,
-                self.target_center,
-                self.current_state,
+            self.all_faces = all_faces
+
+        # In số lượng face nhận diện được (debug)
+        print(f"[DEBUG] SEARCHING: found {len(all_faces)} registered faces")
+
+        if candidates:
+            # Chọn người gần tâm nhất + score cao
+            h, w, _ = frame.shape
+            center_x, center_y = w // 2, h // 2
+            best = max(candidates, key=lambda c: c[2] / (abs(c[3][0]-center_x) + abs(c[3][1]-center_y) + 1))
+            bbox, name, score, center = best
+            self.locked_identity = name
+            self.target_bbox = list(bbox)
+            self.target_center = center
+            self.lock_mode = "FACE"
+            self.kalman.reset()
+            kx, ky = self.kalman.predict_and_correct(center[0], center[1])
+            self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+            self.current_state = self.STATE_TRACKING
+            self.lost_counter = 0
+            self.logger.log("TARGET_ACQUIRED", name=name, score=f"{score:.2f}", room=self.room_name)
+            print(f"[FSM:{self.room_name}] Acquired '{name}' -> TRACKING")
+        else:
+            self._clear_target()
+
+    # =============================================
+    # TRACKING – ổn định, không nhảy lung tung
+    # =============================================
+    def _step_tracking(self, frame):
+        detect_start = time.time()
+        results = self.yolo_face(frame, verbose=False, device=self.device)
+        detect_ms = (time.time() - detect_start) * 1000.0
+
+        candidates = []   # (bbox, name, score, center)
+        all_faces = []
+
+        recognize_start = time.time()
+        for r in results:
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                crop = _crop_safe(frame, xyxy)
+                if crop is None:
+                    continue
+                name, score = self.recognizer.identify(crop)
+                if name is not None:
+                    cx = (xyxy[0] + xyxy[2]) // 2
+                    cy = (xyxy[1] + xyxy[3]) // 2
+                    center = (cx, cy)
+                    candidates.append((xyxy, name, score, center))
+                    all_faces.append({
+                        "name": name,
+                        "bbox": xyxy.tolist(),
+                        "score": score,
+                        "center": center
+                    })
+        recognize_ms = (time.time() - recognize_start) * 1000.0
+        self.last_detect_ms = detect_ms
+        self.last_recognize_ms = recognize_ms
+
+        with self._lock:
+            self.all_faces = all_faces
+
+        print(f"[DEBUG] TRACKING: found {len(all_faces)} registered faces, locked='{self.locked_identity}'")
+
+        # Kiểm tra xem target hiện tại có trong danh sách không
+        current_found = None
+        for cand in candidates:
+            if cand[1] == self.locked_identity:
+                current_found = cand
+                break
+
+        if current_found is not None:
+            # Mặt vẫn nhận diện được bình thường -- đường đi cũ, không đổi.
+            self.lost_counter = 0
+            self.lock_mode = "FACE"
+            bbox, name, score, center = current_found
+            self.target_bbox = list(bbox)
+            self.target_center = center
+            kx, ky = self.kalman.predict_and_correct(center[0], center[1])
+            self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+            self._run_exercise_tracking(frame, self.target_bbox)
+            # KHÔNG CHUYỂN TARGET KHI CÓ NGƯỜI KHÁC – chỉ chuyển khi target hiện tại biến mất
+            return
+
+        # Không nhận diện được mặt target ở frame này -- thử khoá theo
+        # THÂN NGƯỜI (người đó có thể đã đi xa hơn, mặt quá nhỏ/lệch góc
+        # để nhận diện, nhưng vẫn còn trong khung hình ở vị trí gần với
+        # bbox cũ).
+        body_bbox = self._find_body_continuity(frame)
+        if body_bbox is not None:
+            self.lost_counter = 0
+            self.lock_mode = "BODY"
+            cx = (body_bbox[0] + body_bbox[2]) // 2
+            cy = (body_bbox[1] + body_bbox[3]) // 2
+            self.target_bbox = list(body_bbox)
+            self.target_center = (cx, cy)
+            kx, ky = self.kalman.predict_and_correct(cx, cy)
+            self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+            self._run_exercise_tracking(frame, self.target_bbox)
+            return
+
+        # Cả mặt lẫn thân đều không tìm thấy -- thực sự có thể đã mất.
+        self.lost_counter += 1
+        if self.lost_counter >= self.LOST_THRESHOLD:
+            self.current_state = self.STATE_LOST
+            self.logger.log("TARGET_LOST", name=self.locked_identity, room=self.room_name)
+            print(f"[FSM:{self.room_name}] Lost '{self.locked_identity}' -> LOST")
+            exercise_manager.set_online(self.locked_identity, False)
+            self._clear_target()
+        # else: vẫn trong thời gian chờ (grace period), giữ nguyên output cũ.
+
+    def _find_body_continuity(self, frame):
+        """
+        Khi mặt của target đang khoá không còn nhận diện được ở frame này,
+        thử khoá tiếp theo THÂN NGƯỜI: chạy YOLO-person, so khớp IOU với
+        bbox cuối cùng đã biết. Trả về bbox mới (list[int,4]) nếu khớp đủ
+        tốt, ngược lại trả về None.
+        """
+        if self.target_bbox is None:
+            return None
+        try:
+            results = self.yolo_person(frame, verbose=False, device=self.device, classes=[0])
+        except Exception as e:
+            print(f"[AI:{self.room_name}] yolo_person error: {e}")
+            return None
+
+        best_iou = 0.0
+        best_box = None
+        for r in results:
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                iou = _bbox_iou(xyxy, self.target_bbox)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_box = xyxy
+
+        if best_box is not None and best_iou >= 0.25:
+            return list(best_box)
+        return None
+
+    def _run_exercise_tracking(self, frame, bbox):
+        """
+        If the currently-locked person has an assigned exercise, mark them
+        online and feed their body crop into this room's PoseEstimator.
+        Any completed rep is reported to the global exercise_manager.
+        Skipped entirely (cheap no-op) for people with no assignment, to
+        avoid spending CPU on mediapipe for everyone walking past a camera.
+        """
+        name = self.locked_identity
+        if name is None or not exercise_manager.is_assigned(name):
+            return
+
+        exercise_manager.set_online(name, True)
+        crop = _crop_safe(frame, bbox)
+        result = self.pose_estimator.process(name, crop)
+        if result["rep_completed"]:
+            exercise_manager.register_rep(name, result["rep_completed"])
+            self.logger.log(
+                "EXERCISE_REP", name=name, exercise=result["rep_completed"], room=self.room_name
             )
+            print(f"[Exercise:{self.room_name}] '{name}' completed a {result['rep_completed']} rep")
+
+    # =============================================
+    # LOST – tìm lại bất kỳ ai đã đăng ký
+    # =============================================
+    def _step_lost(self, frame):
+        results = self.yolo_face(frame, verbose=False, device=self.device)
+        all_faces = []
+        for r in results:
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                crop = _crop_safe(frame, xyxy)
+                if crop is None:
+                    continue
+                name, score = self.recognizer.identify(crop)
+                if name is not None:
+                    cx = (xyxy[0] + xyxy[2]) // 2
+                    cy = (xyxy[1] + xyxy[3]) // 2
+                    all_faces.append({
+                        "name": name,
+                        "bbox": xyxy.tolist(),
+                        "score": score,
+                        "center": (cx, cy)
+                    })
+        with self._lock:
+            self.all_faces = all_faces
+
+        print(f"[DEBUG] LOST: found {len(all_faces)} registered faces")
+
+        # Tìm target cũ hoặc bất kỳ ai
+        if all_faces:
+            # Ưu tiên target cũ nếu có
+            chosen = None
+            for face in all_faces:
+                if face["name"] == self.locked_identity:
+                    chosen = face
+                    break
+            if chosen is None:
+                chosen = all_faces[0]  # lấy người đầu tiên
+            name = chosen["name"]
+            bbox = chosen["bbox"]
+            center = chosen["center"]
+            self.locked_identity = name
+            self.target_bbox = bbox
+            self.target_center = center
+            self.lock_mode = "FACE"
+            self.kalman.reset()
+            kx, ky = self.kalman.predict_and_correct(center[0], center[1])
+            self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+            self.current_state = self.STATE_TRACKING
+            self.lost_counter = 0
+            self.logger.log("TARGET_REACQUIRED", name=name, room=self.room_name)
+            print(f"[FSM:{self.room_name}] Reacquired '{name}' -> TRACKING")
+        else:
+            self._clear_target()
+
+    # =============================================
+    # Public accessors
+    # =============================================
+    def get_ai_result(self):
+        with self._lock:
+            return self.has_target, self.raw_bbox, self.smoothed_bbox, self.smoothed_center, self.current_state
+
+    def get_all_faces(self):
+        with self._lock:
+            return self.all_faces.copy()
 
     def get_locked_identity(self):
         return self.locked_identity
-
-    def get_room_name(self):
-        return self.room_name
 
     def get_last_latency_ms(self):
         with self._lock:
             return self.last_step_latency_ms
 
-    def reload_face_database(self):
-        """Call this if a new person is registered while operation is running."""
-        self.recognizer.load_database()
+    def get_latency_breakdown(self):
+        with self._lock:
+            return self.last_detect_ms, self.last_recognize_ms
 
     def stop(self):
         self.running = False
