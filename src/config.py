@@ -109,7 +109,7 @@ CAMERAS = [
     {
         "id": "cam1",
         "room_name": "Phong 1",
-        "url": "http://10.248.162.227/stream",
+        "url": "http://10.153.15.178/stream",
     },
     {
         "id": "cam2",
@@ -125,6 +125,15 @@ CAMERA_URL = CAMERAS[0]["url"]
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
 TARGET_FPS = 30
+
+# How long (seconds) CameraReader's watchdog waits with NO new frame,
+# despite the connection still looking "open", before it force-releases
+# the stream and reconnects. Fixes the case where the ESP32-CAM's stream
+# dies mid-connection (Wi-Fi drop, camera reboot, momentary wrong IP...)
+# and cv2.VideoCapture.read() ends up blocked forever instead of actually
+# returning an error -- without this, the camera never automatically
+# recovers even after its signal comes back. See operation/camera_reader.py.
+CAMERA_STALL_TIMEOUT_SEC = 5.0
 
 # ---------------------------------------------------------------------------
 # YOLO / face detection
@@ -149,6 +158,44 @@ FACE_RECOGNITION_THRESHOLD = 0.35
 # re-verified every frame -- this just confirms we're still tracking the
 # right person.
 IDENTITY_RECHECK_INTERVAL = 10
+
+# How often (seconds) each AIPipeline thread checks face_database's
+# face_db_version counter to see if app_registration.py (a SEPARATE
+# process) just registered/deleted someone, and hot-reloads its embeddings
+# if so. This is what removes the "must restart app_dashboard.py after
+# registering someone" requirement. Cheap (one small SELECT) -- 1-3s is a
+# good default; lower it if you want new registrations picked up faster.
+FACE_DB_RELOAD_CHECK_INTERVAL_SEC = 2.0
+
+# ---------------------------------------------------------------------------
+# Body recognition (long-term, clothing-invariant body-shape profile)
+# ---------------------------------------------------------------------------
+# How often (seconds), PER PERSON, each AIPipeline re-measures a
+# registered face's body-shape ratios (see operation/body_features.py).
+# Runs for EVERY registered face seen this step, not just the locked
+# target -- an extra YOLO-person pass + a mediapipe Pose call per person
+# is real CPU cost on top of the existing pipeline, so this is throttled
+# rather than run every frame. Raise it (e.g. 5.0) if CPU is tight with
+# multiple rooms running at once.
+BODY_PROFILE_UPDATE_INTERVAL_SEC = 2.0
+
+# ---------------------------------------------------------------------------
+# Body-shape fallback identification (used when face recognition can't see
+# a face at all -- turned away, too far, bad angle). See ai_pipeline.py's
+# _find_identity_by_body_shape(). Deliberately a SEPARATE, much higher bar
+# than face recognition's own FACE_RECOGNITION_THRESHOLD, since body shape
+# alone is a far weaker biometric signal than a face embedding.
+# ---------------------------------------------------------------------------
+# Targeted re-check: "is this probably the specific person we JUST lost
+# track of" -- a lower bar is acceptable because context already narrows
+# it down to one candidate.
+BODY_MATCH_MIN_SIMILARITY = 0.85
+# Cold match: "does this unrecognized body belong to ANY registered
+# person" -- stricter, since there's no context narrowing the candidates.
+BODY_MATCH_MIN_SIMILARITY_COLD = 0.92
+# A profile needs at least this many real sightings before it's trusted
+# enough to be matched against at all.
+BODY_MATCH_MIN_SAMPLES = 5
 
 # ---------------------------------------------------------------------------
 # Target-loss safety behavior

@@ -53,6 +53,10 @@ class FaceRecognizer:
         # name -> np.ndarray of shape (N, 512), one row per registered angle
         self.database = {}
 
+        # face_db_version we last loaded (see face_database.get_face_db_version()).
+        # -1 guarantees the very first reload_if_changed() call reloads.
+        self._loaded_version = -1
+
     def load_database(self):
         """
         Load every registered person's embeddings from the SQLite face
@@ -61,6 +65,7 @@ class FaceRecognizer:
         restarting the operation app.
         """
         self.database = face_database.load_all_embeddings()
+        self._loaded_version = face_database.get_face_db_version()
 
         total_people = len(self.database)
         total_angles = sum(e.shape[0] for e in self.database.values())
@@ -68,6 +73,36 @@ class FaceRecognizer:
             f"[FaceRecognizer] Loaded {total_people} registered person(s), "
             f"{total_angles} embedding(s) total."
         )
+
+    def reload_if_changed(self):
+        """
+        Cheap check (one small SELECT): compare face_database's
+        face_db_version counter against what we last loaded. If it moved
+        -- meaning app_registration.py (a SEPARATE process) just
+        registered or deleted someone -- reload the in-memory embeddings
+        right away.
+
+        This is what makes a newly-registered person recognizable
+        immediately, without restarting app_dashboard.py / app_operation.py.
+        Call this periodically (e.g. every couple of seconds) from
+        AIPipeline's loop -- NOT every frame, since it hits the database.
+
+        Returns True if a reload actually happened.
+        """
+        try:
+            current_version = face_database.get_face_db_version()
+        except Exception as e:
+            print(f"[FaceRecognizer] version check failed: {e}")
+            return False
+
+        if current_version != self._loaded_version:
+            print(
+                f"[FaceRecognizer] face_db_version changed "
+                f"({self._loaded_version} -> {current_version}), reloading database..."
+            )
+            self.load_database()
+            return True
+        return False
 
     def is_empty(self):
         return len(self.database) == 0

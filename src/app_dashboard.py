@@ -151,6 +151,19 @@ _last_tracking_state = {}  # {name: room_name}
 _tracking_running = False
 _tracking_thread = None
 
+# ---------------------------------------------------------------------------
+# Cross-room movement notifications (PROBLEM #2)
+# ---------------------------------------------------------------------------
+# Unlike _last_tracking_state (which _check_and_capture_tracking() resets
+# to {} the moment every room goes empty, since that's what its own
+# "don't photograph an empty room" rule needs), _last_seen_room is NEVER
+# cleared -- it always remembers the last room each registered name was
+# confirmed in, even across a gap where nobody has a camera on them (e.g.
+# walking through a no-cam room in FLOOR_PLAN). That's what lets a
+# same-person A→(no-cam room)→B transition still be reported correctly.
+_movement_lock = threading.Lock()
+_last_seen_room = {}  # {name: room_name}
+
 
 def _door_room_ids():
     return [cam["id"] for cam in config.CAMERAS]
@@ -219,6 +232,46 @@ def _door_safety_loop():
 
 
 # ---------------------------------------------------------------------------
+# Movement notification logic
+# ---------------------------------------------------------------------------
+def _check_movement(current_state):
+    """
+    current_state: {name: room_name} -- who is CURRENTLY locked as a
+    room's target, same shape _check_and_capture_tracking() already
+    builds every 0.5s.
+
+    For each registered name currently seen somewhere, compare against
+    the last room we ever confirmed them in. If it's a DIFFERENT room,
+    emit a "[name] di chuyển từ [room A] sang [room B]" notification --
+    both to the event log (shows up in the dashboard's timeline via the
+    existing shared_logger -> /api/events pipeline, no frontend changes
+    needed) and as a Socket.IO event for anyone listening live.
+    """
+    global _last_seen_room
+
+    for name, room_name in current_state.items():
+        with _movement_lock:
+            prev_room = _last_seen_room.get(name)
+            _last_seen_room[name] = room_name
+
+        if prev_room is None or prev_room == room_name:
+            continue  # first-ever sighting, or still in the same room -- not a move
+
+        message = f"{name} di chuyển từ {prev_room} sang {room_name}"
+        print(f"[Movement] {message}")
+        if shared_logger:
+            shared_logger.log(
+                "PERSON_MOVED", name=name, from_room=prev_room, to_room=room_name
+            )
+        socketio.emit("movement_notification", {
+            "name": name,
+            "from_room": prev_room,
+            "to_room": room_name,
+            "message": message,
+        })
+
+
+# ---------------------------------------------------------------------------
 # Tracking snapshot logic
 # ---------------------------------------------------------------------------
 def _check_and_capture_tracking():
@@ -234,6 +287,11 @@ def _check_and_capture_tracking():
         identity = room.ai_thread.get_locked_identity()
         if identity:
             current_state[identity] = room.room_name
+
+    # Phát hiện di chuyển giữa các phòng -- chạy độc lập với logic chụp
+    # ảnh bên dưới, vì _last_seen_room không bao giờ bị xóa về {} như
+    # _last_tracking_state.
+    _check_movement(current_state)
 
     with _tracking_lock:
         last_state = dict(_last_tracking_state)
@@ -296,7 +354,8 @@ def _on_exercise_fail(name):
     try:
         face_database.delete_person(name)
         face_database.delete_tracking_history(name)
-        print(f"[Exercise] FAIL -> deleted '{name}' from face database + tracking")
+        face_database.delete_body_profile(name)
+        print(f"[Exercise] FAIL -> deleted '{name}' from face database + tracking + body profile")
     except Exception as e:
         print(f"[Exercise] Error deleting data for '{name}': {e}")
 
@@ -307,6 +366,8 @@ def _on_exercise_fail(name):
             room.ai_thread.force_clear_target()
 
     behavior_manager.forget(name)
+    with _movement_lock:
+        _last_seen_room.pop(name, None)
 
     if shared_logger:
         shared_logger.log("EXERCISE_FAILED_DELETED", name=name)

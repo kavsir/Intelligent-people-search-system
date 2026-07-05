@@ -13,8 +13,8 @@ const uint16_t ws_port = 8765;         // must match config.DOOR_WS_PORT
 const char* ws_path = "/";
 
 // ---- Servos: one pin per door, must match config.CAMERAS ids below ----
-#define DOOR_CAM1_PIN 13   // Phòng 1 door servo
-#define DOOR_CAM2_PIN 14   // Phòng 2 door servo
+#define DOOR_CAM1_PIN 14   // Phòng 2 door servo
+#define DOOR_CAM2_PIN 13   // Phòng 1 door servo
 
 const char* DOOR_ID_CAM1 = "cam1";
 const char* DOOR_ID_CAM2 = "cam2";

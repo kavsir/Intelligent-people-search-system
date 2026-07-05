@@ -12,9 +12,11 @@ from ultralytics import YOLO
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+import face_database
 from operation.event_logger import EventLogger
 from operation.face_recognizer import FaceRecognizer
 from operation.pose_estimator import PoseEstimator
+from operation.body_features import BodyFeatureExtractor
 from operation.exercise_manager import exercise_manager
 from operation.behavior_manager import behavior_manager
 
@@ -102,6 +104,22 @@ class AIPipeline(threading.Thread):
         # threads).
         self.pose_estimator = PoseEstimator()
 
+        # Separate mediapipe Pose instance (also not thread-safe, also one
+        # per room) used ONLY to extract long-term body-shape ratios for
+        # EVERY registered face seen this step -- not just the locked
+        # target. See operation/body_features.py.
+        self.body_extractor = BodyFeatureExtractor()
+        self._last_body_update = {}  # name -> time.time() of last profile update
+        self.BODY_PROFILE_INTERVAL_SEC = getattr(
+            config, "BODY_PROFILE_UPDATE_INTERVAL_SEC", 2.0
+        )
+
+        # Throttle for FaceRecognizer.reload_if_changed() -- see run().
+        self._last_db_check = 0.0
+        self.DB_RELOAD_CHECK_INTERVAL_SEC = getattr(
+            config, "FACE_DB_RELOAD_CHECK_INTERVAL_SEC", 2.0
+        )
+
         self.kalman = KalmanFilter2D()
 
         # FSM
@@ -114,10 +132,23 @@ class AIPipeline(threading.Thread):
         self.locked_identity = None
         self.target_bbox = None
         self.target_center = None
+        # Last non-None locked_identity, kept even after _clear_target()
+        # wipes locked_identity -- used as the first guess when trying to
+        # reacquire someone by BODY SHAPE ALONE (no face visible) in
+        # _step_lost(), since "whoever we were just tracking" is the most
+        # likely candidate for "whoever just reappeared".
+        self._last_locked_identity = None
         # "FACE" while the locked person's face is still recognizable each
-        # frame, "BODY" while we're keeping the lock via YOLO-person + IOU
+        # frame. "BODY" while we're keeping the lock via YOLO-person + IOU
         # continuity because their face faded out (they walked further
-        # away) but they haven't actually left the frame.
+        # away) but they haven't actually left the frame. "BODY_SHAPE"
+        # when neither face NOR IOU continuity found them, but their
+        # long-term body-shape profile (face_database.body_recognition)
+        # matched someone currently visible with high confidence --
+        # weakest of the 3 signals, since body shape alone is a softer
+        # biometric than face recognition, but the only one that works
+        # when someone's face genuinely isn't visible (turned away,
+        # occluded, too far).
         self.lock_mode = None
 
         # Tất cả khuôn mặt đã đăng ký trong frame hiện tại
@@ -145,6 +176,8 @@ class AIPipeline(threading.Thread):
             self.smoothed_center = center
 
     def _clear_target(self):
+        if self.locked_identity is not None:
+            self._last_locked_identity = self.locked_identity
         self.locked_identity = None
         self.target_bbox = None
         self.target_center = None
@@ -175,6 +208,15 @@ class AIPipeline(threading.Thread):
             if not ret or frame is None:
                 time.sleep(0.01)
                 continue
+
+            # Cheap, throttled check: has app_registration.py (a SEPARATE
+            # process) registered or deleted someone since we last loaded
+            # the embeddings? If so, pick it up right away -- this is what
+            # removes the "must restart app_dashboard.py" requirement.
+            now_check = time.time()
+            if now_check - self._last_db_check >= self.DB_RELOAD_CHECK_INTERVAL_SEC:
+                self._last_db_check = now_check
+                self.recognizer.reload_if_changed()
 
             step_start = time.time()
             try:
@@ -236,6 +278,7 @@ class AIPipeline(threading.Thread):
 
         # In số lượng face nhận diện được (debug)
         print(f"[DEBUG] SEARCHING: found {len(all_faces)} registered faces")
+        self._update_body_profiles(frame, all_faces)
 
         if candidates:
             # Chọn người gần tâm nhất + score cao
@@ -295,6 +338,7 @@ class AIPipeline(threading.Thread):
             self.all_faces = all_faces
 
         print(f"[DEBUG] TRACKING: found {len(all_faces)} registered faces, locked='{self.locked_identity}'")
+        self._update_body_profiles(frame, all_faces)
 
         # Kiểm tra xem target hiện tại có trong danh sách không
         current_found = None
@@ -333,7 +377,30 @@ class AIPipeline(threading.Thread):
             self._run_exercise_tracking(frame, self.target_bbox, center=(kx, ky))
             return
 
-        # Cả mặt lẫn thân đều không tìm thấy -- thực sự có thể đã mất.
+        # Cả mặt lẫn thân (IOU) đều không tìm thấy -- trước khi coi là mất
+        # hẳn, thử nhận lại CHÍNH người này bằng HÌNH DÁNG thân người (họ
+        # có thể đã di chuyển hẳn sang vị trí khác trong khung, không còn
+        # overlap với bbox cũ, và mặt đang quay đi chỗ khác).
+        shape_bbox, shape_name, shape_score = self._find_identity_by_body_shape(
+            frame, candidate_names=[self.locked_identity]
+        )
+        if shape_bbox is not None:
+            self.lost_counter = 0
+            self.lock_mode = "BODY_SHAPE"
+            cx = (shape_bbox[0] + shape_bbox[2]) // 2
+            cy = (shape_bbox[1] + shape_bbox[3]) // 2
+            self.target_bbox = shape_bbox
+            self.target_center = (cx, cy)
+            kx, ky = self.kalman.predict_and_correct(cx, cy)
+            self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+            self._run_exercise_tracking(frame, self.target_bbox, center=(kx, ky))
+            self.logger.log(
+                "BODY_SHAPE_MATCH", name=self.locked_identity,
+                similarity=f"{shape_score:.2f}", room=self.room_name,
+            )
+            return
+
+        # Cả 3 cách đều không tìm thấy -- thực sự có thể đã mất.
         self.lost_counter += 1
         if self.lost_counter >= self.LOST_THRESHOLD:
             self.current_state = self.STATE_LOST
@@ -342,6 +409,130 @@ class AIPipeline(threading.Thread):
             exercise_manager.set_online(self.locked_identity, False)
             self._clear_target()
         # else: vẫn trong thời gian chờ (grace period), giữ nguyên output cũ.
+
+    def _update_body_profiles(self, frame, all_faces):
+        """
+        Long-term body-shape tracking for PROBLEM #2 -- runs for EVERY
+        registered face seen this step (all_faces), not just whichever
+        one is currently locked as the main target. This is what makes
+        the body_recognition profile keep improving even for people the
+        FSM isn't actively "tracking" right now.
+
+        For each registered face:
+          1. Match it to a YOLO-person body box (one YOLO-person pass is
+             shared across every face this step -- cheaper than one pass
+             per face).
+          2. Extract clothing-invariant skeleton ratios from that body
+             crop (operation/body_features.py).
+          3. Fold the reading into face_database.body_recognition via an
+             exponential moving average.
+
+        Throttled per-person (BODY_PROFILE_UPDATE_INTERVAL_SEC, default
+        2s) so this doesn't run mediapipe Pose on every single frame for
+        every face -- that would be far too expensive stacked on top of
+        YOLO-face + YOLO-person + InsightFace + the existing PoseEstimator,
+        especially with multiple rooms running at once (see config.py's
+        CPU-tuning notes).
+        """
+        if not all_faces:
+            return
+
+        now = time.time()
+        due_faces = [
+            f for f in all_faces
+            if now - self._last_body_update.get(f["name"], 0.0) >= self.BODY_PROFILE_INTERVAL_SEC
+        ]
+        if not due_faces:
+            return
+
+        try:
+            person_results = self.yolo_person(frame, verbose=False, device=self.device, classes=[0])
+        except Exception as e:
+            print(f"[AI:{self.room_name}] body-profile yolo_person error: {e}")
+            return
+
+        person_boxes = [
+            box.xyxy[0].cpu().numpy().astype(int)
+            for r in person_results for box in r.boxes
+        ]
+        if not person_boxes:
+            return
+
+        for face in due_faces:
+            name = face["name"]
+            fx1, fy1, fx2, fy2 = face["bbox"]
+            fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+
+            # A face sits inside its own body's box, near the top -- pick
+            # the person box whose region contains the face center.
+            body_box = None
+            for pb in person_boxes:
+                if pb[0] <= fcx <= pb[2] and pb[1] <= fcy <= pb[3]:
+                    body_box = pb
+                    break
+            if body_box is None:
+                continue
+
+            crop = _crop_safe(frame, body_box)
+            features = self.body_extractor.extract(crop)
+            self._last_body_update[name] = now  # mark attempted regardless of success
+            if features is None:
+                continue  # partial/occluded skeleton this time -- try again next interval
+
+            try:
+                face_database.update_body_profile(name, features)
+            except Exception as e:
+                print(f"[AI:{self.room_name}] body profile save failed for '{name}': {e}")
+
+    def _find_identity_by_body_shape(self, frame, candidate_names=None, min_similarity=None):
+        """
+        Try to find a registered person among ALL bodies YOLO-person can
+        see in `frame`, using ONLY their long-term body-shape profile
+        (face_database.body_recognition) -- no face required. This is the
+        fallback for when face recognition genuinely can't see a face at
+        all (turned away, too far, bad angle), so a registered person
+        doesn't get treated as "gone" just because their face isn't
+        pointed at the camera right now.
+
+        candidate_names: None = cold match against every profile with
+            enough history (stricter threshold, see config); a list/set =
+            targeted re-check against only those names (looser threshold,
+            since context already narrows it down -- e.g. "probably
+            whoever we were just tracking here").
+
+        Returns (bbox: list[int,4], name: str, similarity: float), or
+        (None, None, 0.0) if nothing clears the bar.
+        """
+        try:
+            person_results = self.yolo_person(frame, verbose=False, device=self.device, classes=[0])
+        except Exception as e:
+            print(f"[AI:{self.room_name}] body-shape match yolo_person error: {e}")
+            return None, None, 0.0
+
+        if min_similarity is None:
+            min_similarity = (
+                config.BODY_MATCH_MIN_SIMILARITY if candidate_names
+                else config.BODY_MATCH_MIN_SIMILARITY_COLD
+            )
+        min_samples = getattr(config, "BODY_MATCH_MIN_SAMPLES", 5)
+
+        best_box, best_name, best_score = None, None, -1.0
+        for r in person_results:
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                crop = _crop_safe(frame, xyxy)
+                features = self.body_extractor.extract(crop)
+                if features is None:
+                    continue
+                name, score = face_database.match_body_profile(
+                    features, candidate_names=candidate_names, min_sample_count=min_samples
+                )
+                if name is not None and score > best_score:
+                    best_box, best_name, best_score = xyxy, name, score
+
+        if best_box is not None and best_score >= min_similarity:
+            return list(best_box), best_name, best_score
+        return None, None, 0.0
 
     def _find_body_continuity(self, frame):
         """
@@ -453,6 +644,7 @@ class AIPipeline(threading.Thread):
             self.all_faces = all_faces
 
         print(f"[DEBUG] LOST: found {len(all_faces)} registered faces")
+        self._update_body_profiles(frame, all_faces)
 
         # Tìm target cũ hoặc bất kỳ ai
         if all_faces:
@@ -478,6 +670,42 @@ class AIPipeline(threading.Thread):
             self.lost_counter = 0
             self.logger.log("TARGET_REACQUIRED", name=name, room=self.room_name)
             print(f"[FSM:{self.room_name}] Reacquired '{name}' -> TRACKING")
+            return
+
+        # Không thấy mặt AI cả -- trước khi tiếp tục chịu ở SEARCHING/LOST,
+        # thử nhận lại bằng HÌNH DÁNG thân người (không cần mặt). Ưu tiên
+        # kiểm tra đúng người vừa mất (nếu có) với ngưỡng dễ hơn, sau đó
+        # mới thử khớp lạnh (cold match) với TẤT CẢ hồ sơ đã đăng ký, với
+        # ngưỡng khắt khe hơn vì không có ngữ cảnh thu hẹp ứng viên.
+        shape_bbox = shape_name = None
+        shape_score = 0.0
+        if self._last_locked_identity is not None:
+            shape_bbox, shape_name, shape_score = self._find_identity_by_body_shape(
+                frame, candidate_names=[self._last_locked_identity]
+            )
+        if shape_bbox is None:
+            shape_bbox, shape_name, shape_score = self._find_identity_by_body_shape(
+                frame, candidate_names=None
+            )
+
+        if shape_bbox is not None:
+            cx = (shape_bbox[0] + shape_bbox[2]) // 2
+            cy = (shape_bbox[1] + shape_bbox[3]) // 2
+            self.locked_identity = shape_name
+            self.target_bbox = shape_bbox
+            self.target_center = (cx, cy)
+            self.lock_mode = "BODY_SHAPE"
+            self.kalman.reset()
+            kx, ky = self.kalman.predict_and_correct(cx, cy)
+            self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+            self.current_state = self.STATE_TRACKING
+            self.lost_counter = 0
+            self.logger.log(
+                "TARGET_REACQUIRED_BY_BODY", name=shape_name,
+                similarity=f"{shape_score:.2f}", room=self.room_name,
+            )
+            print(f"[FSM:{self.room_name}] Reacquired '{shape_name}' by body shape "
+                  f"(similarity={shape_score:.2f}) -> TRACKING")
         else:
             self._clear_target()
 
@@ -504,4 +732,8 @@ class AIPipeline(threading.Thread):
             return self.last_detect_ms, self.last_recognize_ms
 
     def stop(self):
-        self.running = False    
+        self.running = False
+        try:
+            self.body_extractor.close()
+        except Exception:
+            pass
