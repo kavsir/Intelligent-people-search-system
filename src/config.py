@@ -107,12 +107,12 @@ CAMERAS = [
     {
         "id": "cam1",
         "room_name": "Phong 1",
-        "url": "http://10.208.229.179/stream",
+        "url": "http://10.208.229.178/stream",
     },
     {
         "id": "cam2",
         "room_name": "Phong 2",
-        "url": "http://10.208.229.227/stream",
+        "url": "http://10.208.229.117/stream",
     },
 ]
 
@@ -180,6 +180,20 @@ FACE_DB_RELOAD_CHECK_INTERVAL_SEC = 2.0
 # multiple rooms running at once.
 BODY_PROFILE_UPDATE_INTERVAL_SEC = 2.0
 
+# Chi lay NUA THAN TREN (vai/nguc/khuyu tay/co tay) cua bbox than nguoi
+# truoc khi dua vao BodyFeatureExtractor -- xem operation/body_features.py
+# upper_body_box(). Dung CHUNG mot gia tri nay o ca luc xay ho so
+# (_update_body_profiles) lan luc so khop (_find_identity_by_body_shape)
+# de body_aspect_ratio con so sanh duoc giua 2 lan do.
+UPPER_BODY_CROP_RATIO = 0.55
+
+# "Du gan de nua than tren hien ro" -- chi XAY ho so than nguoi
+# (_update_body_profiles) khi bbox than nguoi (YOLO-person, full-body)
+# cao it nhat % nay so voi chieu cao khung hinh. Nguoi dung xa hon cho
+# ra bbox nho hon -> landmark nua than tren (vai/khuyu tay/co tay) de bi
+# lan/nhieu -> bo qua, doi ho toi gan hon (vd vua buoc vao phong) moi do.
+BODY_PROFILE_MIN_HEIGHT_RATIO = 0.45
+
 # ---------------------------------------------------------------------------
 # Body-shape fallback identification (used when face recognition can't see
 # a face at all -- turned away, too far, bad angle). See ai_pipeline.py's
@@ -187,16 +201,13 @@ BODY_PROFILE_UPDATE_INTERVAL_SEC = 2.0
 # than face recognition's own FACE_RECOGNITION_THRESHOLD, since body shape
 # alone is a far weaker biometric signal than a face embedding.
 # ---------------------------------------------------------------------------
-
 # Targeted re-check: "is this probably the specific person we JUST lost
 # track of" -- a lower bar is acceptable because context already narrows
 # it down to one candidate.
 BODY_MATCH_MIN_SIMILARITY = 0.85
-
 # Cold match: "does this unrecognized body belong to ANY registered
 # person" -- stricter, since there's no context narrowing the candidates.
 BODY_MATCH_MIN_SIMILARITY_COLD = 0.92
-
 # A profile needs at least this many real sightings before it's trusted
 # enough to be matched against at all.
 BODY_MATCH_MIN_SAMPLES = 5
@@ -280,21 +291,22 @@ LOST_GRACE_PERIOD_SEC = 1.0
 # registered person is found within a fraction of a second, not noticeably
 # slower from a user's point of view.
 SEARCHING_SKIP_FRAMES = 2
-
-# Same idea as SEARCHING_SKIP_FRAMES, but applied in TRACKING state -- when a
-# face is already locked and tracked, we don't need to re-detect + re-recognize
-# EVERY single frame. 1 = run detection every 2nd frame (~50% CPU reduction
-# during tracking), 2 = every 3rd frame, etc. The Kalman filter keeps the
-# position smooth across skipped frames. 0 = old behavior (detect every frame).
+# In TRACKING, how many pipeline steps to skip between YOLO-face +
+# InsightFace calls while the locked target's face is still visible.
+# The Kalman filter bridges the gap so the smoothed center (crosshair +
+# servo) keeps moving smoothly. 0 = run every step. 1 means: run on step
+# 0, skip step 1, run again on step 2, etc. -- the single biggest CPU
+# saving in the whole pipeline because YOLO-face + InsightFace +
+# body-profile updates are all skipped at once.
 TRACKING_SKIP_FRAMES = 1
 
-# How often to run MediaPipe Pose (exercise tracking + behavior recognition)
-# inside _run_exercise_tracking(). 1 = every frame (old behavior), 2 = every
-# 2nd frame, 3 = every 3rd frame, etc. Pose estimation is one of the single
-# heaviest per-frame costs -- throttling it gives a large CPU saving with
-# almost no visible impact on rep counting or behavior detection accuracy.
+# MediaPipe Pose (used for exercise rep counting + behavior recognition)
+# is one of the heaviest per-step costs. Run it every Nth frame instead
+# of every frame -- still catches every rep/behavior while cutting CPU
+# significantly, especially with multiple rooms running at once.
+# Applies only inside _run_exercise_tracking() when a registered person
+# is locked (SEARCHING/LOST states don't run pose at all).
 POSE_EVERY_N_FRAMES = 2
-
 # Fixed delay (seconds) at the end of every pipeline step, applied only
 # when the step itself was fast. If a step already took a while (because
 # the CPU was busy with the other camera's thread), this sleep is skipped
@@ -409,7 +421,7 @@ HANDOFF_CONFIG = {
 # Thoi gian (giay) cho phong DICH (vd Phong 1) tu quet ra nguoi vua duoc
 # bao "co the dang quay lai" truoc khi phong NGUON (vd Phong 2, cam dong)
 # chu dong xoay servo di tim thay vi ngoi cho thu dong.
-HANDOFF_WAIT_BEFORE_SCAN_SEC = 60
+HANDOFF_WAIT_BEFORE_SCAN_SEC = 10
 
 # Gioi han TILT khi servo dang o che do QUET CHU DONG tim nguoi vua ban giao
 # -- khac voi tilt_min/tilt_max trong SERVO_CONFIG (30-150, dung khi bam

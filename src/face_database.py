@@ -120,14 +120,21 @@ CREATE TABLE IF NOT EXISTS db_meta (
 -- operation/body_features.py) -- never an absolute pixel length, never a
 -- clothing color/texture feature -- so the profile stays valid regardless
 -- of distance-from-camera or what the person is wearing that day.
+--
+-- CHỈ DÙNG NỬA THÂN TRÊN (vai/hông/khuỷu tay/cổ tay) -- torso_leg_ratio
+-- và thigh_shin_ratio là 2 cột CŨ (dùng chân, để lại cho tương thích
+-- ngược với các DB đã tạo trước đây), KHÔNG còn được ghi mới nữa -- xem
+-- upperarm_torso_ratio / forearm_upperarm_ratio thay thế.
 CREATE TABLE IF NOT EXISTS body_recognition (
     person_name           TEXT PRIMARY KEY,
     sample_count          INTEGER NOT NULL DEFAULT 0,
     shoulder_hip_ratio    REAL,   -- shoulder width / hip width
-    torso_leg_ratio       REAL,   -- torso length / (thigh+shin) length
-    thigh_shin_ratio      REAL,   -- thigh length / shin length
+    torso_leg_ratio       REAL,   -- (CŨ, không còn ghi mới) torso length / (thigh+shin) length
+    thigh_shin_ratio      REAL,   -- (CŨ, không còn ghi mới) thigh length / shin length
     shoulder_torso_ratio  REAL,   -- shoulder width / torso length
     body_aspect_ratio     REAL,   -- bbox height/width -- crude thin/stocky proxy, noisiest column
+    upperarm_torso_ratio  REAL,   -- avg(vai->khuỷu tay) / torso length
+    forearm_upperarm_ratio REAL,  -- avg(khuỷu tay->cổ tay) / avg(vai->khuỷu tay)
     updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -139,7 +146,6 @@ CREATE INDEX IF NOT EXISTS idx_theo_doi_person ON theo_doi(person_name);
 CREATE INDEX IF NOT EXISTS idx_theo_doi_time ON theo_doi(captured_at);
 """
 
-
 def _connect():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -150,7 +156,6 @@ def _connect():
     # hitting this same file concurrently.
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
-
 
 def _bump_face_db_version(conn):
     """Increment the face_db_version counter inside an already-open
@@ -165,7 +170,6 @@ def _bump_face_db_version(conn):
         "ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
     )
 
-
 def get_face_db_version():
     """Current face_db_version counter (0 if nobody has ever registered
     yet). Cheap single-row SELECT -- safe to poll every few seconds from
@@ -176,7 +180,6 @@ def get_face_db_version():
         ).fetchone()
         return int(row["value"]) if row else 0
 
-
 def init_db():
     """Create the database file + tables if they don't exist yet. Safe to
     call every time an app starts (registration app, dashboard app, or the
@@ -184,8 +187,23 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with _lock, _connect() as conn:
         conn.executescript(_SCHEMA)
+        _migrate_body_recognition_columns(conn)
+        conn.commit()
     print(f"[FaceDatabase] Ready at {DB_PATH}")
 
+def _migrate_body_recognition_columns(conn):
+    """
+    executescript()'s CREATE TABLE IF NOT EXISTS is a no-op on a DB file
+    that already has an OLDER body_recognition table (created before
+    upperarm_torso_ratio/forearm_upperarm_ratio existed) -- SQLite won't
+    retro-add columns on its own. Check + ALTER TABLE ADD COLUMN for
+    anyone upgrading from a pre-upper-body DB file so update_body_profile()
+    doesn't crash with "no such column".
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(body_recognition)")}
+    for col in ("upperarm_torso_ratio", "forearm_upperarm_ratio"):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE body_recognition ADD COLUMN {col} REAL")
 
 # ---------------------------------------------------------------------------
 # Person helpers
@@ -197,12 +215,10 @@ def _get_or_create_person(conn, name):
     cur = conn.execute("INSERT INTO persons (name) VALUES (?)", (name,))
     return cur.lastrowid
 
-
 def person_exists(name):
     with _lock, _connect() as conn:
         row = conn.execute("SELECT 1 FROM persons WHERE name = ?", (name,)).fetchone()
         return row is not None
-
 
 def list_people():
     """Every registered person's name, sorted -- replaces
@@ -210,7 +226,6 @@ def list_people():
     with _lock, _connect() as conn:
         rows = conn.execute("SELECT name FROM persons ORDER BY name").fetchall()
         return [r["name"] for r in rows]
-
 
 def delete_person(name):
     """Remove a person and (via ON DELETE CASCADE) all their embeddings and
@@ -226,7 +241,6 @@ def delete_person(name):
             _bump_face_db_version(conn)
         conn.commit()
         return cur.rowcount > 0
-
 
 # ---------------------------------------------------------------------------
 # Registration writes (called by registration/face_registrar.py)
@@ -260,7 +274,6 @@ def save_face_data(name, embedding_list, image_list):
 
     print(f"[FaceDatabase] Saved {len(image_list)} image(s)/embedding(s) for '{name}'")
 
-
 def save_processed_images(name, image_list):
     """
     Store the background-removed/enhanced versions produced by
@@ -278,7 +291,6 @@ def save_processed_images(name, image_list):
                     (person_id, idx, buf.tobytes()),
                 )
         conn.commit()
-
 
 # ---------------------------------------------------------------------------
 # Reads
@@ -306,7 +318,6 @@ def get_raw_images(name):
             images.append(img)
     return images
 
-
 def get_processed_images(name):
     """Return this person's processed (background-removed) images, in
     angle order. Handy if the dashboard ever wants to show a person's
@@ -329,7 +340,6 @@ def get_processed_images(name):
             images.append(img)
     return images
 
-
 def load_all_embeddings():
     """
     Return {name: np.ndarray of shape (N, 512)} for every registered person
@@ -349,7 +359,6 @@ def load_all_embeddings():
         database.setdefault(r["name"], []).append(vec)
 
     return {name: np.stack(vectors) for name, vectors in database.items()}
-
 
 # ---------------------------------------------------------------------------
 # Behavior recognition log (Đứng / Di chuyển / Nhảy / Giơ tay / Nằm / squat /
@@ -398,7 +407,6 @@ def log_behavior_snapshot(counts_by_person):
             )
         conn.commit()
 
-
 def get_latest_behavior_counts():
     """
     Return {name: {"stand":..,...,"logged_at":..}} using each person's most
@@ -427,7 +435,6 @@ def get_latest_behavior_counts():
         }
     return result
 
-
 def get_behavior_history(name, limit=500):
     """Time-ordered snapshots for one person -- e.g. for an activity chart
     on the dashboard's per-person detail view."""
@@ -441,14 +448,12 @@ def get_behavior_history(name, limit=500):
         ).fetchall()
     return [dict(r) for r in reversed(rows)]
 
-
 def delete_behavior_history(name):
     """Wipe a person's behavior_log rows -- call alongside delete_person()
     if you want a full reset, not just an unregister."""
     with _lock, _connect() as conn:
         conn.execute("DELETE FROM behavior_log WHERE person_name = ?", (name,))
         conn.commit()
-
 
 # ---------------------------------------------------------------------------
 # Theo dõi (tracking) snapshots
@@ -493,7 +498,6 @@ def save_tracking_snapshot(entries, image_by_room, timestamp=None):
 
     print(f"[FaceDatabase] Saved tracking snapshot: {len(entries)} person(s), {len(image_by_room)} room(s)")
 
-
 def get_latest_tracking():
     """
     Return the most recent tracking snapshot for each person.
@@ -517,7 +521,6 @@ def get_latest_tracking():
         }
     return result
 
-
 def get_tracking_history(name, limit=100):
     """
     Return all tracking snapshots for one person, newest first.
@@ -539,14 +542,12 @@ def get_tracking_history(name, limit=100):
         for r in rows
     ]
 
-
 def delete_tracking_history(name):
     """Wipe a person's theo_doi rows -- call alongside delete_person()
     if you want a full reset."""
     with _lock, _connect() as conn:
         conn.execute("DELETE FROM theo_doi WHERE person_name = ?", (name,))
         conn.commit()
-
 
 # ---------------------------------------------------------------------------
 # Body recognition (long-term, clothing-invariant body-shape profile)
@@ -557,12 +558,11 @@ def delete_tracking_history(name):
 _BODY_EMA_ALPHA = 0.15
 _BODY_FEATURE_COLUMNS = (
     "shoulder_hip_ratio",
-    "torso_leg_ratio",
-    "thigh_shin_ratio",
     "shoulder_torso_ratio",
+    "upperarm_torso_ratio",
+    "forearm_upperarm_ratio",
     "body_aspect_ratio",
 )
-
 
 def update_body_profile(name, features):
     """
@@ -581,15 +581,15 @@ def update_body_profile(name, features):
         if row is None:
             conn.execute(
                 "INSERT INTO body_recognition "
-                "(person_name, sample_count, shoulder_hip_ratio, torso_leg_ratio, "
-                " thigh_shin_ratio, shoulder_torso_ratio, body_aspect_ratio, updated_at) "
+                "(person_name, sample_count, shoulder_hip_ratio, shoulder_torso_ratio, "
+                " upperarm_torso_ratio, forearm_upperarm_ratio, body_aspect_ratio, updated_at) "
                 "VALUES (?, 1, ?, ?, ?, ?, ?, ?)",
                 (
                     name,
                     features.get("shoulder_hip_ratio"),
-                    features.get("torso_leg_ratio"),
-                    features.get("thigh_shin_ratio"),
                     features.get("shoulder_torso_ratio"),
+                    features.get("upperarm_torso_ratio"),
+                    features.get("forearm_upperarm_ratio"),
                     features.get("body_aspect_ratio"),
                     now_str,
                 ),
@@ -603,21 +603,20 @@ def update_body_profile(name, features):
 
             conn.execute(
                 "UPDATE body_recognition SET sample_count = sample_count + 1, "
-                "shoulder_hip_ratio = ?, torso_leg_ratio = ?, thigh_shin_ratio = ?, "
-                "shoulder_torso_ratio = ?, body_aspect_ratio = ?, updated_at = ? "
+                "shoulder_hip_ratio = ?, shoulder_torso_ratio = ?, upperarm_torso_ratio = ?, "
+                "forearm_upperarm_ratio = ?, body_aspect_ratio = ?, updated_at = ? "
                 "WHERE person_name = ?",
                 (
                     ema("shoulder_hip_ratio"),
-                    ema("torso_leg_ratio"),
-                    ema("thigh_shin_ratio"),
                     ema("shoulder_torso_ratio"),
+                    ema("upperarm_torso_ratio"),
+                    ema("forearm_upperarm_ratio"),
                     ema("body_aspect_ratio"),
                     now_str,
                     name,
                 ),
             )
         conn.commit()
-
 
 def get_body_profile(name):
     """Return this person's current body profile dict, or None if they've
@@ -628,25 +627,23 @@ def get_body_profile(name):
         ).fetchone()
     return dict(row) if row else None
 
-
 def get_all_body_profiles():
     """Every registered person's current body profile -- {name: {...}}."""
     with _lock, _connect() as conn:
         rows = conn.execute("SELECT * FROM body_recognition").fetchall()
     return {r["person_name"]: dict(r) for r in rows}
 
-
 # Weights used by feature_similarity() below -- body_aspect_ratio is the
 # noisiest of the 5 columns (pose/arm-position sensitive), so it counts
-# least toward the final score.
+# least toward the final score. Chỉ dùng nửa thân trên -- không còn
+# torso_leg_ratio/thigh_shin_ratio (cần thấy chân) trong bộ trọng số này.
 BODY_FEATURE_WEIGHTS = {
-    "shoulder_hip_ratio": 0.25,
-    "torso_leg_ratio": 0.30,
-    "thigh_shin_ratio": 0.20,
-    "shoulder_torso_ratio": 0.20,
+    "shoulder_hip_ratio": 0.30,
+    "shoulder_torso_ratio": 0.25,
+    "upperarm_torso_ratio": 0.25,
+    "forearm_upperarm_ratio": 0.15,
     "body_aspect_ratio": 0.05,
 }
-
 
 def feature_similarity(a, b):
     """
@@ -669,7 +666,6 @@ def feature_similarity(a, b):
         weighted_score += weight * score
         total_weight += weight
     return (weighted_score / total_weight) if total_weight > 0 else 0.0
-
 
 def match_body_profile(features, candidate_names=None, min_sample_count=5):
     """
@@ -706,14 +702,12 @@ def match_body_profile(features, candidate_names=None, min_sample_count=5):
         return None, 0.0
     return best_name, best_score
 
-
 def delete_body_profile(name):
     """Wipe a person's body_recognition row -- call alongside
     delete_person() if you want a full reset."""
     with _lock, _connect() as conn:
         conn.execute("DELETE FROM body_recognition WHERE person_name = ?", (name,))
         conn.commit()
-
 
 # Ensure the DB/tables exist as soon as this module is imported, same as
 # how face_registrar.py / face_recognizer.py load their models at import
