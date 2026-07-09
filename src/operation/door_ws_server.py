@@ -22,7 +22,16 @@ messages multiplexed by a "door" field):
 `door` must match a config.CAMERAS[*]["id"] (e.g. "cam1", "cam2") -- this
 is what ties a servo to the room whose camera decides whether that
 specific door is allowed to be opened. See esp32_servo.ino, which drives
-two Servo objects (DOOR_CAM1_PIN, DOOR_CAM2_PIN) off this single board.
+FOUR servos off ONE PCA9685 on this single board (pan, tilt, door-cam1,
+door-cam2).
+
+Pan/tilt (cam2's camera-following servo, see operation/servo_controller.py)
+now ALSO rides this same WebSocket connection instead of a separate Serial
+USB link -- see send_pan_tilt() below. It's a different, fire-and-forget
+message shape ({"servo": "pantilt", "pan": .., "tilt": ..}), multiplexed
+on the same physical link as the door {"door": .., "cmd"/"state": ..}
+messages, since esp32_servo.ino is one board with one WebSocket client
+connection either way.
 
 Runs its own asyncio event loop in a background thread, so it can live
 inside the same process as the Flask app regardless of which async_mode
@@ -40,7 +49,6 @@ import time
 
 import websockets
 
-
 class _DoorState:
     """Per-door (not per-connection) bookkeeping. Both doors share the
     same underlying ESP32 WebSocket connection."""
@@ -48,7 +56,6 @@ class _DoorState:
     def __init__(self):
         self.state = "UNKNOWN"   # "OPEN" | "CLOSED" | "UNKNOWN"
         self.pending_ack = None  # asyncio.Future, set while a command is in flight
-
 
 class DoorWebSocketServer:
     def __init__(self, host="0.0.0.0", port=8765, door_ids=None,
@@ -243,4 +250,36 @@ class DoorWebSocketServer:
             return True
         except asyncio.TimeoutError:
             print(f"[DoorWS] Timed out waiting for ESP32 ack (door '{door_id}')")
+            return False
+
+    def send_pan_tilt(self, pan, tilt):
+        """
+        Fire-and-forget: push a new pan/tilt target to the single physical
+        ESP32 over the SAME WebSocket connection used for doors (see
+        esp32_servo.ino -- one link multiplexes {"door": ...} and
+        {"servo": "pantilt", ...} messages). Unlike send_command() for
+        doors, this does NOT block waiting for an ack: servo_controller.py's
+        PID loop calls this up to ~20x/second (send_interval_sec), far too
+        often to block on a round-trip each time, and a continuous
+        position stream has no natural "ack" to wait for anyway.
+
+        Returns True if the message was handed to the event loop for
+        sending (best-effort -- doesn't guarantee delivery), False if no
+        ESP32 is connected right now.
+        """
+        with self._lock:
+            ws = self._esp32_ws
+        if ws is None or self._loop is None:
+            return False
+
+        payload = json.dumps({
+            "servo": "pantilt",
+            "pan": int(round(pan)),
+            "tilt": int(round(tilt)),
+        })
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send(payload), self._loop)
+            return True
+        except Exception as e:
+            print(f"[DoorWS] send_pan_tilt failed: {e}")
             return False

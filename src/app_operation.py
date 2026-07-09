@@ -5,9 +5,12 @@ debug dashboard with all camera feeds side-by-side and a simple 2D top-down
 floor map that lights up red for whichever room currently has a detected
 target.
 
-Cameras are fixed-position -- there is no pan/tilt servo. Each room's
-pipeline only detects and recognizes whoever is in its own frame; nothing
-moves the camera to follow a person.
+Cameras are fixed-position EXCEPT where config.SERVO_ENABLED_ROOMS says
+otherwise (currently cam2 only) -- that room has a pan/tilt servo mount
+that physically steers the camera to keep the locked, registered target
+centered in frame (see operation/servo_controller.py, driven from inside
+AIPipeline). Every other room's pipeline still only detects/recognizes
+whoever is in its own fixed frame; nothing moves those cameras.
 
 Architecture note: each ESP32-CAM streams MJPEG directly to this machine.
 The ESP32-S3 is a separate coordination gateway (HTTP/MQTT) that tells each
@@ -40,13 +43,14 @@ behavior_manager.start()
 class RoomUnit:
     """Holds every thread/object that belongs to one physical camera/room."""
 
-    def __init__(self, cam_config, shared_logger):
+    def __init__(self, cam_config, shared_logger, door_ws=None):
         self.id = cam_config["id"]
         self.room_name = cam_config["room_name"]
 
         self.camera_thread = CameraReader(url=cam_config["url"], name=self.room_name)
         self.ai_thread = AIPipeline(
-            self.camera_thread, event_logger=shared_logger, room_name=self.room_name
+            self.camera_thread, event_logger=shared_logger, room_name=self.room_name,
+            room_id=self.id, door_ws=door_ws,
         )
 
         # Per-room FPS counter state (each camera can run at a slightly
@@ -75,7 +79,6 @@ class RoomUnit:
             self._fps_start_time = time.time()
         return self._fps_text
 
-
 # ---------------------------------------------------------------------------
 # Config validation
 # ---------------------------------------------------------------------------
@@ -100,7 +103,6 @@ def validate_camera_config(cameras):
             print(f"  - {err}")
         raise SystemExit(1)
 
-
 # ---------------------------------------------------------------------------
 # Drawing helpers
 # ---------------------------------------------------------------------------
@@ -113,7 +115,6 @@ def draw_event_feed(frame, events, origin=(10, 90), line_height=16, max_lines=6)
             frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1
         )
         y += line_height
-
 
 def render_room_panel(frame, room, fps_text):
     """
@@ -141,6 +142,22 @@ def render_room_panel(frame, room, fps_text):
     # Crosshair
     cv2.line(frame, (cx - 10, cy), (cx + 10, cy), (255, 255, 255), 1)
     cv2.line(frame, (cx, cy - 10), (cx, cy + 10), (255, 255, 255), 1)
+
+    # ===== Vẽ biên ảo Handoff (config.HANDOFF_CONFIG) =====
+    # Phòng tĩnh (vd cam1): 2 vạch dọc tím tại boundary_ratio% mỗi bên khung
+    # hình -- đây chính là "vùng biên" dùng để suy luận hướng mất dấu
+    # (_estimate_exit_direction trong ai_pipeline.py). Vẽ ra để người vận
+    # hành nhìn thấy trực quan ranh giới trái/phải mà không cần servo.
+    handoff_cfg = getattr(config, "HANDOFF_CONFIG", {}).get(room.id)
+    if handoff_cfg and handoff_cfg.get("type") == "static":
+        ratio = handoff_cfg.get("boundary_ratio", 0.20)
+        left_x = int(w * ratio)
+        right_x = int(w * (1 - ratio))
+        boundary_color = (255, 0, 255)  # magenta
+        cv2.line(frame, (left_x, 0), (left_x, h), boundary_color, 1)
+        cv2.line(frame, (right_x, 0), (right_x, h), boundary_color, 1)
+        cv2.putText(frame, "L", (left_x + 3, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, boundary_color, 1)
+        cv2.putText(frame, "R", (right_x - 14, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, boundary_color, 1)
 
     # ===== Vẽ TẤT CẢ các khuôn mặt đã đăng ký (trừ target chính) =====
     for face in all_faces:
@@ -211,13 +228,24 @@ def render_room_panel(frame, room, fps_text):
         1,
     )
 
+    servo_enabled, pan_angle, tilt_angle = room.ai_thread.get_servo_status()
+    if servo_enabled:
+        cv2.putText(
+            frame,
+            f"Pan: {pan_angle:.0f} Tilt: {tilt_angle:.0f}",
+            (w - 150, 38),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 200, 255),
+            1,
+        )
+
     uv_text = f"(u,v)=({target_center[0]},{target_center[1]})" if target_center else "(u,v)=N/A"
     cv2.putText(
         frame, uv_text, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
     )
 
     return has_target
-
 
 def draw_topdown_map(room_has_target, room_names, cell_size=140, gap=12):
     """
@@ -264,7 +292,6 @@ def draw_topdown_map(room_has_target, room_names, cell_size=140, gap=12):
 
     return canvas
 
-
 def tile_horizontally(frames):
     """Stack frames side-by-side, padding heights so they line up evenly."""
     max_h = max(f.shape[0] for f in frames)
@@ -275,7 +302,6 @@ def tile_horizontally(frames):
             f = cv2.resize(f, (int(f.shape[1] * scale), max_h))
         resized.append(f)
     return cv2.hconcat(resized)
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -365,7 +391,6 @@ def main():
     shared_logger.close()
     cv2.destroyAllWindows()
     print("[Main] System shut down safely.")
-
 
 if __name__ == "__main__":
     main()

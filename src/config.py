@@ -8,6 +8,7 @@ import os
 # ---------------------------------------------------------------------------
 # Device selection (NVIDIA GPU if available, otherwise CPU)
 # ---------------------------------------------------------------------------
+
 # USE_GPU=True means "prefer GPU". Every model loader still falls back to
 # CPU automatically if no usable GPU/CUDA setup is found at runtime, so
 # this never crashes the app on a machine without a GPU.
@@ -23,7 +24,6 @@ def get_torch_device():
         return "cpu"
     try:
         import torch
-
         if torch.cuda.is_available():
             return "cuda"
     except Exception:
@@ -35,7 +35,6 @@ def get_insightface_ctx_id():
     """
     Return the ctx_id expected by InsightFace's FaceAnalysis.prepare():
     a GPU index (0, 1, ...) to use CUDA, or -1 to force CPU.
-
     InsightFace uses onnxruntime under the hood. If onnxruntime-gpu (with a
     working CUDA setup) isn't installed, onnxruntime silently falls back to
     its CPU provider on its own -- but checking torch.cuda.is_available()
@@ -47,7 +46,6 @@ def get_insightface_ctx_id():
         return -1
     try:
         import torch
-
         if torch.cuda.is_available():
             return 0
     except Exception:
@@ -58,9 +56,9 @@ def get_insightface_ctx_id():
 # ---------------------------------------------------------------------------
 # Path setup
 # ---------------------------------------------------------------------------
+
 # src/config.py -> project root is one level up
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
@@ -77,18 +75,19 @@ FACE_DB_PATH = os.path.join(DATA_DIR, "face_dataset.db")
 # ---------------------------------------------------------------------------
 # Door servo ESP32 (Dev Module) -- WebSocket
 # ---------------------------------------------------------------------------
-# ONE physical ESP32 Dev Module drives BOTH door servos (Phòng 1 + Phòng 2)
+# ONE physical ESP32 Dev Module drives BOTH door servos (Phong 1 + Phong 2)
 # and connects IN to this server as a single WebSocket *client* (see
 # operation/door_ws_server.py and esp32_servo.ino). Each door/room is
 # addressed by the same id as its entry in CAMERAS (e.g. "cam1", "cam2"),
 # multiplexed over that one connection -- we don't need to know the
 # ESP32's IP, we just bind and listen here.
 # ---------------------------------------------------------------------------
+
 # Cross-app links
 # ---------------------------------------------------------------------------
 # Port app_registration.py listens on (see its `app.run(..., port=...)`).
 # app_dashboard.py exposes this via /api/config so dashboard.html can build
-# a working "Đăng ký khuôn mặt" link regardless of which host/IP the
+# a working "Dang ky khuon mat" link regardless of which host/IP the
 # dashboard is being viewed from.
 REGISTRATION_APP_PORT = 5000
 
@@ -104,17 +103,16 @@ DOOR_WS_PORT = 8765        # must match `ws_port` in esp32_servo.ino
 #     button press, regardless of who's present.
 # There is no "close after N seconds of absence" timer anymore: closing is
 # triggered by presence being detected, not by absence.
-
 CAMERAS = [
     {
         "id": "cam1",
         "room_name": "Phong 1",
-        "url": "http://10.153.15.178/stream",
+        "url": "http://10.208.229.179/stream",
     },
     {
         "id": "cam2",
         "room_name": "Phong 2",
-        "url": "http://10.153.15.227/stream",
+        "url": "http://10.208.229.227/stream",
     },
 ]
 
@@ -138,6 +136,7 @@ CAMERA_STALL_TIMEOUT_SEC = 5.0
 # ---------------------------------------------------------------------------
 # YOLO / face detection
 # ---------------------------------------------------------------------------
+
 YOLO_FACE_MODEL_PATH = os.path.join(MODELS_DIR, "yolov8n-face.pt")
 YOLO_PERSON_MODEL_PATH = os.path.join(MODELS_DIR, "yolov8n.pt")
 
@@ -147,6 +146,7 @@ AI_CONF_THRESHOLD = 0.5
 # ---------------------------------------------------------------------------
 # Face recognition (InsightFace)
 # ---------------------------------------------------------------------------
+
 # Minimum cosine similarity (normed embeddings -> plain dot product) for a
 # detected face to be considered a match for a registered person. Lower this
 # (e.g. 0.4) if recognition feels too strict; raise it if strangers are
@@ -170,6 +170,7 @@ FACE_DB_RELOAD_CHECK_INTERVAL_SEC = 2.0
 # ---------------------------------------------------------------------------
 # Body recognition (long-term, clothing-invariant body-shape profile)
 # ---------------------------------------------------------------------------
+
 # How often (seconds), PER PERSON, each AIPipeline re-measures a
 # registered face's body-shape ratios (see operation/body_features.py).
 # Runs for EVERY registered face seen this step, not just the locked
@@ -186,16 +187,74 @@ BODY_PROFILE_UPDATE_INTERVAL_SEC = 2.0
 # than face recognition's own FACE_RECOGNITION_THRESHOLD, since body shape
 # alone is a far weaker biometric signal than a face embedding.
 # ---------------------------------------------------------------------------
+
 # Targeted re-check: "is this probably the specific person we JUST lost
 # track of" -- a lower bar is acceptable because context already narrows
 # it down to one candidate.
 BODY_MATCH_MIN_SIMILARITY = 0.85
+
 # Cold match: "does this unrecognized body belong to ANY registered
 # person" -- stricter, since there's no context narrowing the candidates.
 BODY_MATCH_MIN_SIMILARITY_COLD = 0.92
+
 # A profile needs at least this many real sightings before it's trusted
 # enough to be matched against at all.
 BODY_MATCH_MIN_SAMPLES = 5
+
+# ---------------------------------------------------------------------------
+# Pan/tilt servo (CAM2 ONLY -- add-on, not a replacement)
+# ---------------------------------------------------------------------------
+# Physically steers cam2's camera mount to keep the currently-locked,
+# REGISTERED person's face/body centered in frame. Every existing
+# mechanism keeps working exactly as before, for every room INCLUDING
+# cam2: face recognition, the SEARCHING/TRACKING/LOST FSM, the body-shape
+# fallback, exercise/behavior tracking, door lockdown, tracking-photo
+# snapshots, movement notifications. The servo only reacts to WHERE the
+# pipeline already decided the target is (whatever lock_mode found them);
+# it never changes WHO is tracked or HOW.
+#
+# Hardware: ALL FOUR servos (pan, tilt, cua cam1, cua cam2) now live on ONE
+# ESP32 Dev Module + ONE PCA9685 board (channels 0/1/2/3 respectively),
+# talking to the server over the SAME WebSocket connection used for the
+# doors -- see esp32_servo.ino + operation/door_ws_server.py's
+# send_pan_tilt() + operation/servo_controller.py. No Serial/USB link and
+# no separate esp32_pca9685_controller.ino needed anymore -- that firmware
+# was merged into esp32_servo.ino.
+SERVO_ENABLED_ROOMS = ["cam2"]
+
+SERVO_CONFIG = {
+    "control": {
+        "kp_pan": 0.025,
+        "kp_tilt": 0.025,
+        "kd_pan": 0.015,
+        "kd_tilt": 0.010,
+        "ki_pan": 0.0008,
+        "ki_tilt": 0.0008,
+        "integral_limit_px": 300,
+        "error_filter_alpha": 0.35,
+        "dead_zone_hysteresis_factor": 1.6,
+        "dead_zone_px": 25,
+        "max_step_per_frame": 10,
+        "step_ramp_per_frame_deg": 0.5,
+        "pan_min": 0,
+        "pan_max": 180,
+        "tilt_min": 30,
+        "tilt_max": 150,
+        "pan_center": 90,
+        "tilt_center": 90,
+        "invert_pan": True,
+        "invert_tilt": False,
+        # Toi thieu bao nhieu giay giua 2 lan gui lenh pan/tilt qua WebSocket
+        # (tranh spam qua nhieu goi tin/giay toi ESP32).
+        "send_interval_sec": 0.05,
+    },
+}
+
+# Sau bao nhieu step lien tiep KHONG co muc tieu (has_target=False) thi
+# servo tu tra ve vi tri trung tam an toan (pan_center/tilt_center) --
+# tuong duong safety.return_to_center_on_lost + lost_target_frames_threshold
+# o project pan-tilt goc.
+SERVO_RETURN_TO_CENTER_AFTER_LOST_FRAMES = 15
 
 # ---------------------------------------------------------------------------
 # Target-loss safety behavior
@@ -222,6 +281,20 @@ LOST_GRACE_PERIOD_SEC = 1.0
 # slower from a user's point of view.
 SEARCHING_SKIP_FRAMES = 2
 
+# Same idea as SEARCHING_SKIP_FRAMES, but applied in TRACKING state -- when a
+# face is already locked and tracked, we don't need to re-detect + re-recognize
+# EVERY single frame. 1 = run detection every 2nd frame (~50% CPU reduction
+# during tracking), 2 = every 3rd frame, etc. The Kalman filter keeps the
+# position smooth across skipped frames. 0 = old behavior (detect every frame).
+TRACKING_SKIP_FRAMES = 1
+
+# How often to run MediaPipe Pose (exercise tracking + behavior recognition)
+# inside _run_exercise_tracking(). 1 = every frame (old behavior), 2 = every
+# 2nd frame, 3 = every 3rd frame, etc. Pose estimation is one of the single
+# heaviest per-frame costs -- throttling it gives a large CPU saving with
+# almost no visible impact on rep counting or behavior detection accuracy.
+POSE_EVERY_N_FRAMES = 2
+
 # Fixed delay (seconds) at the end of every pipeline step, applied only
 # when the step itself was fast. If a step already took a while (because
 # the CPU was busy with the other camera's thread), this sleep is skipped
@@ -231,11 +304,11 @@ SEARCHING_SKIP_FRAMES = 2
 STEP_SLEEP_SEC = 0.01
 STEP_SLEEP_SKIP_IF_STEP_TOOK_LONGER_THAN_SEC = 0.03
 
-
 # ---------------------------------------------------------------------------
-# Behavior recognition (Đứng / Di chuyển / Nhảy / Giơ tay / Nằm)
+# Behavior recognition (Dung / Di chuyen / Nhay / Gio tay / Nam)
 # ---------------------------------------------------------------------------
 BEHAVIOR_SNAPSHOT_INTERVAL_SEC = 5
+
 # ---------------------------------------------------------------------------
 # Floor plan & inferred presence
 # ---------------------------------------------------------------------------
@@ -247,43 +320,108 @@ INFERRED_PRESENCE_TIMEOUT_SEC = 60
 
 # Floor plan room definitions.
 # Each room has:
-#   id         – must match a CAMERAS[*]["id"] if the room has a camera,
+#   id         -- must match a CAMERAS[*]["id"] if the room has a camera,
 #                or any unique string for cam-less rooms.
-#   name       – display label on the floor map.
-#   cam_id     – set to the matching camera id if this room has a cam,
+#   name       -- display label on the floor map.
+#   cam_id     -- set to the matching camera id if this room has a cam,
 #                or None for cam-less rooms.
-#   neighbors  – list of room ids directly reachable from this room.
+#   neighbors  -- list of room ids directly reachable from this room.
 #                Used by the inference engine to decide which no-cam rooms
 #                to highlight when a target disappears from a cam room.
 FLOOR_PLAN = [
     {
         "id": "p1",
-        "name": "Phòng 1",
+        "name": "Phong 1",
         "cam_id": "cam1",
         "neighbors": ["p2"],
     },
     {
         "id": "p2",
-        "name": "Phòng 2",
+        "name": "Phong 2",
         "cam_id": "cam2",
         "neighbors": ["p1", "p3", "p4", "p5"],
     },
     {
         "id": "p3",
-        "name": "Phòng 3",
+        "name": "Phong 3",
         "cam_id": None,
         "neighbors": ["p2"],
     },
     {
         "id": "p4",
-        "name": "Phòng 4",
+        "name": "Phong 4",
         "cam_id": None,
         "neighbors": ["p2"],
     },
     {
         "id": "p5",
-        "name": "Phòng 5",
+        "name": "Phong 5",
         "cam_id": None,
         "neighbors": ["p2"],
     },
 ]
+
+# ---------------------------------------------------------------------------
+# Handoff doi tuong Phong 1 (tinh) <-> Phong 2 (dong, servo pan/tilt)
+# ---------------------------------------------------------------------------
+# "type": toa do nao dang tin de suy luan huong mat dau.
+#   - "static":  cam khong xoay -- KHONG chia bien trai/phai nua. He Phong 1
+#                mat dau (bat ke ly do/huong gi) la coi nhu doi tuong co the
+#                da sang Phong 2, chu dong quay don dau servo cam2 luon.
+#   - "dynamic": dung goc Pan servo, vi cam luon xoay bam muc tieu nen
+#                pixel khong phan anh vi tri that trong phong.
+HANDOFF_CONFIG = {
+    "cam1": {  # Phong 1 -- cam tinh
+        "type": "static",
+        "handoff_to_room": "cam2",
+        "handoff_to_pan": 130,
+    },
+    "cam2": {  # Phong 2 -- cam dong (pan/tilt)
+        "type": "dynamic",
+        "pan_left_boundary": 40,
+        "pan_right_boundary": 160,
+        "boundary_confirm_frames": 8,
+        "exit_towards_room": {
+            "LEFT": "cam1",
+            "RIGHT": None,
+        },
+        # BAT KE mat tich vi ly do/huong gi (ke ca direction="UNKNOWN" --
+        # tuc mat dau binh thuong, khong phai do cham bien pan) deu roi
+        # ve phong nay de bao truoc + bat dau dem gio cho quet.
+        "default_target_room": "cam1",
+    },
+}
+# Luu y: SERVO_CONFIG["control"]["pan_min"/"pan_max"] (0-180 do) van giu
+# nguyen la gioi han co khi cua servo. HANDOFF_CONFIG["cam2"]["pan_left/
+# right_boundary"] (40/160 do) la bien logic cua can phong, hep hon -- servo
+# van co the quay xa hon ve mat co khi, nhung he thong coi viec vuot bien
+# logic la "doi tuong da roi phong".
+#
+# Neu trong thuc te bien "ra khoi phong ve huong Phong 1" lai la BIEN PHAI
+# (vi du do invert_pan=True lam nguoc chieu truc giac), chi can doi lai:
+#   "exit_towards_room": {"LEFT": None, "RIGHT": "cam1"}
+# -- khong can sua logic o servo_controller.py / ai_pipeline.py /
+# app_dashboard.py, vi tat ca deu doc gia tri tu day.
+
+# ---------------------------------------------------------------------------
+# Ban giao Phong 2 (dong) -> Phong 1 (tinh): cho + tu quet tim
+# ---------------------------------------------------------------------------
+# Thoi gian (giay) cho phong DICH (vd Phong 1) tu quet ra nguoi vua duoc
+# bao "co the dang quay lai" truoc khi phong NGUON (vd Phong 2, cam dong)
+# chu dong xoay servo di tim thay vi ngoi cho thu dong.
+HANDOFF_WAIT_BEFORE_SCAN_SEC = 60
+
+# Gioi han TILT khi servo dang o che do QUET CHU DONG tim nguoi vua ban giao
+# -- khac voi tilt_min/tilt_max trong SERVO_CONFIG (30-150, dung khi bam
+# muc tieu binh thuong bang PID). Quet chu dong dung dai rong hon theo yeu
+# cau: 40 -> 160.
+HANDOFF_SCAN_TILT_MIN = 40
+HANDOFF_SCAN_TILT_MAX = 160
+
+# Buoc xoay (do) moi lan tick khi dang quet chu dong.
+HANDOFF_SCAN_STEP_DEG = 3
+
+# Chu ky (giay) giua 2 lan tick quet chu dong -- khong can nhanh nhu PID
+# (send_interval_sec=0.05s) vi day chi la quet "mo" khong bam theo error do
+# duoc, quet cham vua de mat nguoi van kip nhin thay khi camera luot qua.
+HANDOFF_SCAN_TICK_INTERVAL_SEC = 0.3
