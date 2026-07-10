@@ -112,7 +112,7 @@ CAMERAS = [
     {
         "id": "cam2",
         "room_name": "Phong 2",
-        "url": "http://10.208.229.117/stream",
+        "url": "http://10.208.229.227/stream",
     },
 ]
 
@@ -210,7 +210,7 @@ BODY_MATCH_MIN_SIMILARITY = 0.85
 BODY_MATCH_MIN_SIMILARITY_COLD = 0.92
 # A profile needs at least this many real sightings before it's trusted
 # enough to be matched against at all.
-BODY_MATCH_MIN_SAMPLES = 5
+BODY_MATCH_MIN_SAMPLES = 2
 
 # ---------------------------------------------------------------------------
 # Pan/tilt servo (CAM2 ONLY -- add-on, not a replacement)

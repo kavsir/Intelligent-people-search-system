@@ -59,10 +59,7 @@ class KalmanFilter2D:
         return int(corrected[0][0]), int(corrected[1][0])
 
     def predict_only(self):
-        """Predict next position WITHOUT a measurement correction.
-        Used on skip-frames in TRACKING to keep the smoothed position
-        moving smoothly while saving the cost of YOLO+InsightFace.
-        Returns (cx, cy) or (None, None) if the filter was never seeded."""
+        """Predict next position WITHOUT a measurement correction."""
         if not self.initialized:
             return None, None
         predicted = self.kf.predict()
@@ -109,9 +106,10 @@ class AIPipeline(threading.Thread):
             print(f"[AI:{self.room_name}] WARNING: face_db empty.")
 
         self.pose_estimator = PoseEstimator()
+        
+        # Chỉ giữ lại model trích xuất đặc trưng để DÙNG CHO VIỆC SO KHỚP (nhận diện)
+        # Đã XÓA hoàn toàn logic tự động quét rải rác để cập nhật (_update_body_profiles)
         self.body_extractor = BodyFeatureExtractor()
-        self._last_body_update = {}
-        self.BODY_PROFILE_INTERVAL_SEC = getattr(config, "BODY_PROFILE_UPDATE_INTERVAL_SEC", 2.0)
 
         self._last_db_check = 0.0
         self.DB_RELOAD_CHECK_INTERVAL_SEC = getattr(config, "FACE_DB_RELOAD_CHECK_INTERVAL_SEC", 2.0)
@@ -350,7 +348,6 @@ class AIPipeline(threading.Thread):
             self.all_faces = all_faces
 
         print(f"[DEBUG] SEARCHING: found {len(all_faces)} registered faces")
-        self._update_body_profiles(frame, all_faces)
 
         if candidates:
             # Ưu tiên 1: Thấy mặt -> khóa bằng FACE
@@ -441,7 +438,6 @@ class AIPipeline(threading.Thread):
             self.all_faces = all_faces
 
         print(f"[DEBUG] TRACKING: found {len(all_faces)} registered faces, locked='{self.locked_identity}'")
-        self._update_body_profiles(frame, all_faces)
 
         current_found = None
         for cand in candidates:
@@ -501,56 +497,6 @@ class AIPipeline(threading.Thread):
         self.lost_counter += 1
         if self.lost_counter >= self.LOST_THRESHOLD:
             self._declare_lost_with_handoff("TARGET_LOST")
-
-    def _update_body_profiles(self, frame, all_faces):
-        if not all_faces:
-            return
-        now = time.time()
-        due_faces = [
-            f for f in all_faces
-            if now - self._last_body_update.get(f["name"], 0.0) >= self.BODY_PROFILE_INTERVAL_SEC
-        ]
-        if not due_faces:
-            return
-        try:
-            person_results = self.yolo_person(frame, verbose=False, device=self.device, classes=[0])
-        except Exception as e:
-            print(f"[AI:{self.room_name}] body-profile yolo_person error: {e}")
-            return
-
-        person_boxes = [box.xyxy[0].cpu().numpy().astype(int) for r in person_results for box in r.boxes]
-        if not person_boxes:
-            return
-
-        frame_h = frame.shape[0]
-
-        for face in due_faces:
-            name = face["name"]
-            fx1, fy1, fx2, fy2 = face["bbox"]
-            fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
-
-            body_box = None
-            for pb in person_boxes:
-                if pb[0] <= fcx <= pb[2] and pb[1] <= fcy <= pb[3]:
-                    body_box = pb
-                    break
-            if body_box is None:
-                continue
-
-            box_h = body_box[3] - body_box[1]
-            if box_h < config.BODY_PROFILE_MIN_HEIGHT_RATIO * frame_h:
-                continue
-
-            crop = _crop_safe(frame, upper_body_box(body_box, config.UPPER_BODY_CROP_RATIO))
-            features = self.body_extractor.extract(crop)
-            self._last_body_update[name] = now
-            if features is None:
-                continue
-
-            try:
-                face_database.update_body_profile(name, features)
-            except Exception as e:
-                print(f"[AI:{self.room_name}] body profile save failed for '{name}': {e}")
 
     def _find_identity_by_body_shape(self, frame, candidate_names=None, min_similarity=None):
         try:
@@ -654,7 +600,6 @@ class AIPipeline(threading.Thread):
             self.all_faces = all_faces
 
         print(f"[DEBUG] LOST: found {len(all_faces)} registered faces")
-        self._update_body_profiles(frame, all_faces)
 
         if all_faces:
             chosen = None

@@ -3,20 +3,20 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AIoT Face Registration</title>
+    <title>AIoT Face & Body Registration</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
     <div class="container">
-        <h1>Face Registration System</h1>
+        <h1>Face & Body Registration System</h1>
         <!-- Tab switcher -->
         <div class="tab-header">
             <button class="tab-btn active" data-tab="upload">📁 Choose image from device</button>
-            <button class="tab-btn" data-tab="webcam">📷 Capture via webcam (5 angles)</button>
+            <button class="tab-btn" data-tab="webcam">📷 Webcam (Face + Body)</button>
         </div>
 
-        <!-- Tab 1: static image upload -->
         <div class="tab-content">
+            <!-- Tab 1: static image upload -->
             <div id="tab-upload" class="tab-panel active">
                 <div class="upload-area">
                     <input type="file" id="imageInput" accept="image/*">
@@ -32,27 +32,51 @@
                 </div>
             </div>
 
-            <!-- Tab 2: multi-angle webcam workflow -->
+            <!-- Tab 2: webcam workflow -->
             <div id="tab-webcam" class="tab-panel">
+                <!-- VIDEO ĐƯỢC ĐẶT Ở ĐÂY ĐỂ KHÔNG BỊ ẨN KHI CHUYỂN BƯỚC -->
                 <div class="webcam-area">
                     <video id="webcamVideo" autoplay playsinline></video>
                     <canvas id="webcamCanvas" style="display:none;"></canvas>
+                </div>
 
+                <!-- STEP 1: Face Registration (Chỉ ẩn các nút bấm, không ẩn video) -->
+                <div id="face-registration-step">
                     <div class="webcam-controls">
                         <button id="captureBtn">📸 Capture this angle</button>
                         <button id="resetCaptureBtn" class="btn-danger">🔄 Start over</button>
                         <span id="angle-hint">Angle: Loading...</span>
                         <span id="capture-count">Captured: 0/5</span>
                     </div>
-
                     <div id="webcam-status" class="status-msg"></div>
-                    <!-- Preview grid of the 5 captured angles -->
                     <div id="captured-preview"></div>
                 </div>
-                <div class="name-input">
+
+                <!-- STEP 2: Body Registration -->
+                <div id="body-registration-panel" style="display: none; margin-top: 20px; border-top: 2px solid #28a745; padding-top: 20px;">
+                    <h3 style="text-align: center; color: #28a745;">✅ Face Registered! Step 2: Body Shape</h3>
+                    <p style="text-align: center; color: #d9534f; font-weight: bold;">⚠️ Vui lòng lùi xa camera để thấy rõ nửa thân trên.</p>
+                    
+                    <div class="webcam-controls">
+                        <button id="captureBodyFrontBtn">📸 1. Chụp phía trước (có mặt)</button>
+                        <button id="captureBodyBackBtn" disabled>📸 2. Quay lưng và chụp</button>
+                        <button id="resetBodyBtn" class="btn-danger">🔄 Làm lại</button>
+                        <span id="body-hint" style="color: #007bff; font-weight: bold;">Yêu cầu: Chụp phía trước</span>
+                        <span id="body-count">Đã chụp: 0/2</span>
+                    </div>
+
+                    <div id="body-status" class="status-msg"></div>
+                    <div id="body-preview" style="margin-top: 15px; display: flex; flex-wrap: wrap; justify-content: center; gap: 12px;"></div>
+
+                    <div class="name-input" style="border-top: none; padding-top: 0; margin-top: 10px;">
+                        <button id="saveBodyBtn" disabled style="background: #28a745;">💾 Lưu dữ liệu cơ thể</button>
+                    </div>
+                </div>
+
+                <div id="webcam-name-input" class="name-input">
                     <label for="webcamName">Person's name:</label>
                     <input type="text" id="webcamName" placeholder="e.g. JohnSmith">
-                    <button id="saveWebcamBtn">💾 Save 5-angle dataset</button>
+                    <button id="saveWebcamBtn">💾 Save 5-angle face dataset</button>
                 </div>
             </div>
         </div>
