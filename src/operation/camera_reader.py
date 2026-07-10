@@ -7,27 +7,6 @@ In the multi-camera setup, each ESP32-CAM streams directly to this machine
 coordination gateway (HTTP/MQTT) that tells each ESP32-CAM when to
 stream/snapshot/sleep -- it does not carry video. Create one CameraReader
 instance per physical camera, passing that camera's own url/name.
-
---------------------------------------------------------------------------
-Why a watchdog thread (fixes "signal comes back but the app never notices")
---------------------------------------------------------------------------
-The naive reconnect loop below (release -> sleep -> reopen on a failed
-read) only runs if cap.read() actually RETURNS. In practice, once a
-chunked MJPEG-over-HTTP stream dies mid-connection (camera rebooted,
-Wi-Fi hiccup, wrong IP for a moment, etc.), cv2.VideoCapture.read() can
-block far longer than CAP_PROP_READ_TIMEOUT_MSEC actually enforces --
-this property isn't reliably honored by every OpenCV/FFmpeg build for
-this kind of stream. When that happens, run() is frozen INSIDE that one
-read() call and never reaches the "dropped frame, reconnecting" branch --
-so even once the camera/network is reachable again, nothing ever retries.
-
-The watchdog (a second thread) tracks how long it's been since the last
-frame. If that exceeds CAMERA_STALL_TIMEOUT_SEC while a connection is
-still nominally "good" (self.ret == True), it calls cap.release() from
-THIS other thread -- which forces the blocked cap.read() in run() to
-return/raise, letting run()'s normal reconnect path take back over
-(including automatically picking the stream up again the moment it's
-actually reachable).
 """
 
 import os
@@ -41,8 +20,37 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 
+# ---------------------------------------------------------------------------
+# Cấu hình FFmpeg để xử lý MJPEG stream từ ESP32-CAM ổn định hơn.
+# ESP32-CAM gửi MJPEG qua HTTP không có container chuẩn, gói tin dễ bị lỗi
+# khi qua Wi-Fi. Các flags này giúp FFmpeg:
+#   - nobuffer:       không tích luỹ buffer lớn, đọc frame mới nhất ngay
+#   - low_delay:      ưu tiên độ trễ thấp (quan trọng cho real-time)
+#   - max_delay:      giới hạn thời gian chờ tối đa 500ms cho 1 packet
+#   - analyzeduration: bỏ qua phân tích stream kéo dài
+#   - probesize:      giới hạn kích thước probe để mở stream nhanh hơn
+#   - err_detect:     bỏ qua các lỗi bitstream nhẹ thay vì crash
+# ---------------------------------------------------------------------------
+_FFMPEG_OPTIONS = (
+    "fflags;nobuffer|"
+    "flags;low_delay|"
+    "max_delay;500000|"
+    "analyzeduration;0|"
+    "probesize;32|"
+    "err_detect;ignore_err"
+)
+
+# Đặt biến môi trường MỘT LẦN khi module được import.
+# OPENCV_FFMPEG_CAPTURE_OPTIONS được OpenCV đọc khi mở VideoCapture với
+# backend FFmpeg (cv2.CAP_FFMPEG). Định dạng: "key1;val1|key2;val2|..."
+_ALREADY_SET = "_OPENCV_FFMPEG_OPTIONS_SET"
+if not os.environ.get(_ALREADY_SET):
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = _FFMPEG_OPTIONS
+    os.environ[_ALREADY_SET] = "1"
+
+
 class CameraReader(threading.Thread):
-    def __init__(self, url=None, name="camera", stall_timeout_sec=None):
+    def __init__(self, url=None, name="camera"):
         """
         url:  MJPEG stream URL for this specific ESP32-CAM. Defaults to
               config.CAMERA_URL for backward compatibility with single-camera
@@ -51,9 +59,6 @@ class CameraReader(threading.Thread):
         name: Human-readable label used only in log/print messages, so it's
               obvious which physical camera a given log line refers to when
               several CameraReader threads are running at once.
-        stall_timeout_sec: how long with no new frame before the watchdog
-              force-reconnects. Defaults to config.CAMERA_STALL_TIMEOUT_SEC
-              (or 5s if that isn't set).
         """
         super().__init__()
         self.url = url or config.CAMERA_URL
@@ -64,29 +69,27 @@ class CameraReader(threading.Thread):
         self.lock = threading.Lock()
         self.running = True
         self.daemon = True
+        self._reconnect_count = 0
+        self._max_reconnect_delay = 5  # giây – max backoff
 
-        self._last_frame_time = time.time()
-        self.stall_timeout_sec = stall_timeout_sec or getattr(
-            config, "CAMERA_STALL_TIMEOUT_SEC", 5.0
-        )
-        self._watchdog_thread = None
+    def _calc_backoff(self):
+        """Exponential backoff: 1s, 2s, 4s, capped at _max_reconnect_delay."""
+        delay = min(2 ** self._reconnect_count, self._max_reconnect_delay)
+        return delay
 
     def _open_capture(self):
-        """Open the stream with short open/read timeouts so a missing
-        camera fails fast (a few seconds) instead of hanging on the
-        default OS-level TCP timeout (which can be 20-60+ seconds on
-        Windows for an unreachable host)."""
-        cap = cv2.VideoCapture(self.url)
-        # These properties are honored by the FFMPEG backend (used for
-        # http:// URLs); harmless no-ops on backends that ignore them.
+        """
+        Mở MJPEG stream từ ESP32-CAM với các thiết lập chịu lỗi.
+
+        - Dùng backend FFmpeg tường minh (cv2.CAP_FFMPEG) thay vì auto-detect,
+          để chắc chắn các flags trong OPENCV_FFMPEG_CAPTURE_OPTIONS có hiệu lực.
+        - set buffersize=1 để luôn lấy frame mới nhất, giảm độ trễ.
+        - set timeout ngắn để fail-fast khi camera mất kết nối.
+        """
+        cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
         cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)
-        # Reset the stall clock on every (re)connect attempt too, not just
-        # on a successful frame -- otherwise the watchdog could judge a
-        # brand-new connection "stalled" before it even had a chance to
-        # start receiving frames.
-        with self.lock:
-            self._last_frame_time = time.time()
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
     def run(self):
@@ -95,62 +98,54 @@ class CameraReader(threading.Thread):
 
         while self.running:
             if self.cap.isOpened():
-                ret, frame = self.cap.read()
+                try:
+                    ret, frame = self.cap.read()
+                except cv2.error as e:
+                    # Bắt lỗi C++ assertion từ FFmpeg backend (vd:
+                    # "pkt->stream_index < (unsigned)s->nb_streams")
+                    # khi ESP32-CAM gửi packet MJPEG bị hỏng/cụt qua Wi-Fi.
+                    # Thay vì crash process, ta reconnect stream.
+                    print(
+                        f"[CameraReader:{self.cam_name}] OpenCV error reading frame: {e}"
+                    )
+                    ret = False
+                    # Đảm bảo cap được release để tránh rò rỉ resource
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+
                 if ret:
                     with self.lock:
                         self.frame = frame
                         self.ret = True
-                        self._last_frame_time = time.time()
+                    # Reset backoff khi đọc frame thành công
+                    self._reconnect_count = 0
                 else:
-                    print(f"[CameraReader:{self.cam_name}] Warning: dropped frame. Reconnecting...")
                     with self.lock:
                         self.ret = False
-                    self.cap.release()
-                    time.sleep(1)
+                    delay = self._calc_backoff()
+                    self._reconnect_count += 1
+                    print(
+                        f"[CameraReader:{self.cam_name}] Warning: dropped frame. "
+                        f"Reconnecting in {delay}s (attempt #{self._reconnect_count})..."
+                    )
+                    time.sleep(delay)
                     self.cap = self._open_capture()
             else:
-                print(f"[CameraReader:{self.cam_name}] ERROR: could not open stream. Retrying in 2s...")
+                delay = self._calc_backoff()
+                self._reconnect_count += 1
+                print(
+                    f"[CameraReader:{self.cam_name}] ERROR: could not open stream. "
+                    f"Retrying in {delay}s (attempt #{self._reconnect_count})..."
+                )
                 with self.lock:
                     self.ret = False
-                time.sleep(2)
+                time.sleep(delay)
                 self.cap = self._open_capture()
 
         if self.cap:
             self.cap.release()
-
-    def _watchdog_run(self):
-        """
-        Runs in a SEPARATE thread from run(). See module docstring for why
-        this exists -- in short, it unsticks run() if it's frozen inside a
-        blocking cap.read() call on a connection that died without
-        actually returning an error.
-        """
-        while self.running:
-            time.sleep(1.0)
-
-            with self.lock:
-                currently_ok = self.ret
-                seconds_since_frame = time.time() - self._last_frame_time
-            cap = self.cap  # plain attribute read; worst case we release a
-                             # moment-old reference, which is harmless
-
-            if currently_ok and seconds_since_frame > self.stall_timeout_sec and cap is not None:
-                print(
-                    f"[CameraReader:{self.cam_name}] No frame for "
-                    f"{seconds_since_frame:.1f}s despite an apparently-open "
-                    f"connection -- forcing a reconnect..."
-                )
-                with self.lock:
-                    self.ret = False
-                try:
-                    cap.release()
-                except Exception as e:
-                    print(f"[CameraReader:{self.cam_name}] watchdog release() error: {e}")
-
-    def start(self):
-        super().start()
-        self._watchdog_thread = threading.Thread(target=self._watchdog_run, daemon=True)
-        self._watchdog_thread.start()
 
     def get_frame(self):
         """Thread-safe accessor for the most recent frame."""
