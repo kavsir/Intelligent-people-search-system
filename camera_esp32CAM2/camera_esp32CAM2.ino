@@ -3,7 +3,7 @@
 
 //===================== WIFI =====================
 const char* ssid = "seele";
-const char* password = "0123456789.";
+const char* password = "0123456789. ";
 
 //================= AI Thinker ESP32-CAM =================
 #define PWDN_GPIO_NUM     32

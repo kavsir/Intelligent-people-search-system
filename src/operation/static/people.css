@@ -51,6 +51,44 @@
 .pp-door-closed  { background: rgba(100,116,139,.2); color: var(--muted); }
 .pp-door-unknown { background: rgba(249,115,22,.2); color: var(--orange); }
 
+/* ------------------------------------------------------------------ */
+/* Tracking photo cell                                                */
+/* ------------------------------------------------------------------ */
+.pp-photo-cell {
+  width: 140px;
+  text-align: center;
+  white-space: normal;
+}
+
+.pp-photo-wrap {
+  display: inline-block;
+  text-align: center;
+}
+
+.pp-photo {
+  width: 120px;
+  height: 90px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  display: block;
+}
+
+.pp-photo-time {
+  display: block;
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pp-photo-empty {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
 /* Exercise / activity cell */
 .pp-activity { display: flex; align-items: center; gap: 6px; }
 .pp-activity-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
@@ -60,7 +98,7 @@
 .pp-reps { font-variant-numeric: tabular-nums; color: var(--text); }
 .pp-reps .pp-target { color: var(--muted); }
 
-/* Online/offline status badge (this is the live tracking status) */
+/* Online/offline status badge */
 .pp-status {
   font-size: 10px; padding: 3px 9px; border-radius: 999px; font-weight: 700;
   display: inline-block;

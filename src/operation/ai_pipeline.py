@@ -1,7 +1,6 @@
 """
-AI tracking pipeline – ổn định target, hiển thị tất cả khuôn mặt đã đăng ký.
+AI tracking pipeline -- ổn định target, hiển thị tất cả khuôn mặt đã đăng ký.
 """
-
 import os
 import sys
 import threading
@@ -12,9 +11,12 @@ from ultralytics import YOLO
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+import face_database
 from operation.event_logger import EventLogger
 from operation.face_recognizer import FaceRecognizer
 from operation.pose_estimator import PoseEstimator
+from operation.body_features import BodyFeatureExtractor, upper_body_box
+from operation.servo_controller import ServoController
 from operation.exercise_manager import exercise_manager
 from operation.behavior_manager import behavior_manager
 
@@ -56,6 +58,13 @@ class KalmanFilter2D:
         corrected = self.kf.correct(meas)
         return int(corrected[0][0]), int(corrected[1][0])
 
+    def predict_only(self):
+        """Predict next position WITHOUT a measurement correction."""
+        if not self.initialized:
+            return None, None
+        predicted = self.kf.predict()
+        return int(predicted[0]), int(predicted[1])
+
     def reset(self):
         self.initialized = False
 
@@ -71,12 +80,15 @@ def _crop_safe(frame, bbox):
 
 
 class AIPipeline(threading.Thread):
-    def __init__(self, camera_thread, event_logger=None, room_name="camera"):
+    def __init__(self, camera_thread, event_logger=None, room_name="camera", room_id=None,
+                 door_ws=None):
         super().__init__()
         self.camera_thread = camera_thread
         self.running = True
         self.daemon = True
         self.room_name = room_name
+        self.room_id = room_id or room_name
+        self.door_ws = door_ws
         self.logger = event_logger or EventLogger()
 
         self.device = config.get_torch_device()
@@ -86,10 +98,6 @@ class AIPipeline(threading.Thread):
             print(f"[AI:{self.room_name}] WARNING: face model not found, using person model.")
             self.yolo_face = YOLO(config.YOLO_PERSON_MODEL_PATH)
 
-        # Used only as a fallback in TRACKING when the locked person's
-        # face can no longer be recognized (too far / bad angle) -- lets
-        # us keep the lock on their BODY instead of losing them outright,
-        # and is also what feeds the exercise pose estimator.
         self.yolo_person = YOLO(config.YOLO_PERSON_MODEL_PATH)
 
         self.recognizer = FaceRecognizer()
@@ -97,12 +105,40 @@ class AIPipeline(threading.Thread):
         if self.recognizer.is_empty():
             print(f"[AI:{self.room_name}] WARNING: face_db empty.")
 
-        # One PoseEstimator per room (mediapipe Pose objects are not
-        # thread-safe, so this must never be shared across AIPipeline
-        # threads).
         self.pose_estimator = PoseEstimator()
+        
+        # Chỉ giữ lại model trích xuất đặc trưng để DÙNG CHO VIỆC SO KHỚP (nhận diện)
+        # Đã XÓA hoàn toàn logic tự động quét rải rác để cập nhật (_update_body_profiles)
+        self.body_extractor = BodyFeatureExtractor()
+
+        self._last_db_check = 0.0
+        self.DB_RELOAD_CHECK_INTERVAL_SEC = getattr(config, "FACE_DB_RELOAD_CHECK_INTERVAL_SEC", 2.0)
+
+        # Frame-skip counters
+        self._frame_counter = 0
+        self.SEARCHING_SKIP_FRAMES = getattr(config, "SEARCHING_SKIP_FRAMES", 0)
+        self.TRACKING_SKIP_FRAMES = getattr(config, "TRACKING_SKIP_FRAMES", 0)
+        self.POSE_EVERY_N_FRAMES = getattr(config, "POSE_EVERY_N_FRAMES", 1)
 
         self.kalman = KalmanFilter2D()
+
+        # Servo
+        self.servo = None
+        self._servo_lost_counter = 0
+        self._servo_was_tracking = False
+        self._last_frame_shape = None
+        self.SERVO_RETURN_TO_CENTER_AFTER_LOST_FRAMES = getattr(config, "SERVO_RETURN_TO_CENTER_AFTER_LOST_FRAMES", 15)
+        
+        if self.room_id in getattr(config, "SERVO_ENABLED_ROOMS", []):
+            try:
+                self.servo = ServoController(config.SERVO_CONFIG, door_ws=self.door_ws)
+                if self.door_ws is None:
+                    print(f"[AI:{self.room_name}] Pan/tilt servo ENABLED (room id='{self.room_id}') but no door_ws -- SIMULATE mode.")
+                else:
+                    print(f"[AI:{self.room_name}] Pan/tilt servo ENABLED (room id='{self.room_id}').")
+            except Exception as e:
+                print(f"[AI:{self.room_name}] Servo init failed ({e}) -- continuing WITHOUT servo.")
+                self.servo = None
 
         # FSM
         self.STATE_SEARCHING = "SEARCHING"
@@ -110,22 +146,20 @@ class AIPipeline(threading.Thread):
         self.STATE_LOST = "LOST"
         self.current_state = self.STATE_SEARCHING
 
-        # Target chính
+        # Target
         self.locked_identity = None
         self.target_bbox = None
         self.target_center = None
-        # "FACE" while the locked person's face is still recognizable each
-        # frame, "BODY" while we're keeping the lock via YOLO-person + IOU
-        # continuity because their face faded out (they walked further
-        # away) but they haven't actually left the frame.
+        self._last_locked_identity = None
         self.lock_mode = None
 
-        # Tất cả khuôn mặt đã đăng ký trong frame hiện tại
-        self.all_faces = []   # list of dict {name, bbox, score, center}
-
-        # Đếm frame mất target liên tục (để chuyển sang LOST)
+        self.all_faces = []
         self.lost_counter = 0
-        self.LOST_THRESHOLD = 10   # 10 frame mất -> coi là lost
+        self.LOST_THRESHOLD = 10
+
+        # Handoff
+        self.on_target_lost_callback = None
+        self._boundary_exit_streak = 0
 
         # Output lock
         self._lock = threading.Lock()
@@ -143,8 +177,39 @@ class AIPipeline(threading.Thread):
             self.raw_bbox = raw_bbox
             self.smoothed_bbox = smoothed_bbox
             self.smoothed_center = center
+        self._drive_servo(has_target, center)
+
+    def _drive_servo(self, has_target, center):
+        if self.servo is None:
+            return
+
+        if has_target and center is not None and self._last_frame_shape is not None:
+            self._servo_lost_counter = 0
+            self._servo_was_tracking = True
+            h, w = self._last_frame_shape
+            cx, cy = w / 2.0, h / 2.0
+            error_x = center[0] - cx
+            error_y = center[1] - cy
+            self.servo.update(error_x, error_y)
+            return
+
+        if self._servo_was_tracking:
+            self.servo.reset_integral()
+            self._servo_was_tracking = False
+
+        self._servo_lost_counter += 1
+        if (self._servo_lost_counter == self.SERVO_RETURN_TO_CENTER_AFTER_LOST_FRAMES
+                and not self.servo.scanning):
+            self.servo.go_to_center(config.SERVO_CONFIG)
+
+    def get_servo_status(self):
+        if self.servo is None:
+            return False, None, None
+        return True, self.servo.pan_angle, self.servo.tilt_angle
 
     def _clear_target(self):
+        if self.locked_identity is not None:
+            self._last_locked_identity = self.locked_identity
         self.locked_identity = None
         self.target_bbox = None
         self.target_center = None
@@ -153,18 +218,54 @@ class AIPipeline(threading.Thread):
         self._set_output(False, None, None, None)
 
     def force_clear_target(self):
-        """
-        Thread-safe external request to drop whatever this room is
-        currently locked onto and go back to SEARCHING. Used when the
-        locked person's registration data was just deleted (they failed
-        an assigned exercise), so we stop tracking someone who no longer
-        exists in face_db.
-        """
         self.current_state = self.STATE_SEARCHING
         self._clear_target()
 
     def get_lock_mode(self):
         return self.lock_mode
+
+    def set_on_target_lost_callback(self, fn):
+        self.on_target_lost_callback = fn
+
+    def _estimate_exit_direction(self):
+        cfg = config.HANDOFF_CONFIG.get(self.room_id)
+        if cfg is None:
+            return "UNKNOWN", {}
+        if cfg["type"] == "static":
+            cx = self.target_center[0] if self.target_center is not None else None
+            return "UNKNOWN", {"center_x": cx}
+        if self.servo is None:
+            return "UNKNOWN", {}
+        pan = self.servo.pan_angle
+        if pan >= cfg["pan_right_boundary"]:
+            return "RIGHT", {"pan_angle": pan}
+        if pan <= cfg["pan_left_boundary"]:
+            return "LEFT", {"pan_angle": pan}
+        return "UNKNOWN", {"pan_angle": pan}
+
+    def _check_dynamic_boundary_exit(self):
+        cfg = config.HANDOFF_CONFIG.get(self.room_id)
+        if cfg is None or cfg.get("type") != "dynamic" or self.servo is None:
+            self._boundary_exit_streak = 0
+            return False
+        pan = self.servo.pan_angle
+        beyond = pan <= cfg["pan_left_boundary"] or pan >= cfg["pan_right_boundary"]
+        self._boundary_exit_streak = self._boundary_exit_streak + 1 if beyond else 0
+        return self._boundary_exit_streak >= cfg.get("boundary_confirm_frames", 8)
+
+    def _declare_lost_with_handoff(self, reason_event):
+        name = self.locked_identity
+        direction, meta = self._estimate_exit_direction()
+        self.current_state = self.STATE_LOST
+        self.logger.log(reason_event, name=name, room=self.room_name, direction=direction, **meta)
+        print(f"[FSM:{self.room_name}] Lost '{name}' ({reason_event}) -> LOST, direction={direction}")
+        exercise_manager.set_online(name, False)
+        if self.on_target_lost_callback:
+            try:
+                self.on_target_lost_callback(name, self.room_id, direction, self.target_center)
+            except Exception as e:
+                print(f"[AI:{self.room_name}] on_target_lost_callback error: {e}")
+        self._clear_target()
 
     def run(self):
         print(f"[AI:{self.room_name}] FSM started.")
@@ -175,6 +276,11 @@ class AIPipeline(threading.Thread):
             if not ret or frame is None:
                 time.sleep(0.01)
                 continue
+
+            now_check = time.time()
+            if now_check - self._last_db_check >= self.DB_RELOAD_CHECK_INTERVAL_SEC:
+                self._last_db_check = now_check
+                self.recognizer.reload_if_changed()
 
             step_start = time.time()
             try:
@@ -187,9 +293,16 @@ class AIPipeline(threading.Thread):
 
             with self._lock:
                 self.last_step_latency_ms = (time.time() - step_start) * 1000.0
-            time.sleep(0.01)
+
+            # Smart sleep
+            step_ms = self.last_step_latency_ms
+            max_step_ms = getattr(config, "STEP_SLEEP_SKIP_IF_STEP_TOOK_LONGER_THAN_SEC", 0.03) * 1000.0
+            if step_ms < max_step_ms:
+                time.sleep(getattr(config, "STEP_SLEEP_SEC", 0.01))
 
     def _step(self, frame):
+        self._last_frame_shape = frame.shape[:2]
+        self._frame_counter += 1
         if self.current_state == self.STATE_SEARCHING:
             self._step_searching(frame)
         elif self.current_state == self.STATE_TRACKING:
@@ -201,11 +314,14 @@ class AIPipeline(threading.Thread):
     # SEARCHING
     # =============================================
     def _step_searching(self, frame):
+        if self.SEARCHING_SKIP_FRAMES > 0 and self._frame_counter % (self.SEARCHING_SKIP_FRAMES + 1) != 0:
+            return
+
         detect_start = time.time()
         results = self.yolo_face(frame, verbose=False, device=self.device)
         detect_ms = (time.time() - detect_start) * 1000.0
 
-        candidates = []   # (bbox, name, score, center)
+        candidates = []
         all_faces = []
 
         recognize_start = time.time()
@@ -222,10 +338,7 @@ class AIPipeline(threading.Thread):
                     center = (cx, cy)
                     candidates.append((xyxy, name, score, center))
                     all_faces.append({
-                        "name": name,
-                        "bbox": xyxy.tolist(),
-                        "score": score,
-                        "center": center
+                        "name": name, "bbox": xyxy.tolist(), "score": score, "center": center
                     })
         recognize_ms = (time.time() - recognize_start) * 1000.0
         self.last_detect_ms = detect_ms
@@ -234,11 +347,10 @@ class AIPipeline(threading.Thread):
         with self._lock:
             self.all_faces = all_faces
 
-        # In số lượng face nhận diện được (debug)
         print(f"[DEBUG] SEARCHING: found {len(all_faces)} registered faces")
 
         if candidates:
-            # Chọn người gần tâm nhất + score cao
+            # Ưu tiên 1: Thấy mặt -> khóa bằng FACE
             h, w, _ = frame.shape
             center_x, center_y = w // 2, h // 2
             best = max(candidates, key=lambda c: c[2] / (abs(c[3][0]-center_x) + abs(c[3][1]-center_y) + 1))
@@ -255,17 +367,51 @@ class AIPipeline(threading.Thread):
             self.logger.log("TARGET_ACQUIRED", name=name, score=f"{score:.2f}", room=self.room_name)
             print(f"[FSM:{self.room_name}] Acquired '{name}' -> TRACKING")
         else:
-            self._clear_target()
+            # Ưu tiên 2: KHÔNG thấy mặt -> thử nhận diện bằng hình dáng thân người
+            shape_bbox, shape_name, shape_score = self._find_identity_by_body_shape(
+                frame, candidate_names=None
+            )
+            if shape_bbox is not None:
+                cx = (shape_bbox[0] + shape_bbox[2]) // 2
+                cy = (shape_bbox[1] + shape_bbox[3]) // 2
+                self.locked_identity = shape_name
+                self.target_bbox = shape_bbox
+                self.target_center = (cx, cy)
+                self.lock_mode = "BODY_SHAPE"
+                self.kalman.reset()
+                kx, ky = self.kalman.predict_and_correct(cx, cy)
+                self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+                self.current_state = self.STATE_TRACKING
+                self.lost_counter = 0
+                self.logger.log(
+                    "TARGET_ACQUIRED_BY_BODY", name=shape_name,
+                    similarity=f"{shape_score:.2f}", room=self.room_name,
+                )
+                print(f"[FSM:{self.room_name}] Acquired '{shape_name}' by BODY SHAPE "
+                      f"(similarity={shape_score:.2f}) -> TRACKING")
+            else:
+                self._clear_target()
 
     # =============================================
-    # TRACKING – ổn định, không nhảy lung tung
+    # TRACKING -- ổn định, không nhảy lung tung
     # =============================================
     def _step_tracking(self, frame):
+        # --- Skip-frame fast path ---
+        if self.TRACKING_SKIP_FRAMES > 0 and self._frame_counter % (self.TRACKING_SKIP_FRAMES + 1) != 0:
+            if self.target_center is not None and self.target_bbox is not None:
+                pred = self.kalman.predict_only()
+                if pred[0] is not None:
+                    self._set_output(True, self.target_bbox, self.target_bbox, pred)
+            if self.target_bbox is not None:
+                self._run_exercise_tracking(frame, self.target_bbox, center=self.target_center)
+            return
+
+        # --- Normal (full-detection) path below ---
         detect_start = time.time()
         results = self.yolo_face(frame, verbose=False, device=self.device)
         detect_ms = (time.time() - detect_start) * 1000.0
 
-        candidates = []   # (bbox, name, score, center)
+        candidates = []
         all_faces = []
 
         recognize_start = time.time()
@@ -282,10 +428,7 @@ class AIPipeline(threading.Thread):
                     center = (cx, cy)
                     candidates.append((xyxy, name, score, center))
                     all_faces.append({
-                        "name": name,
-                        "bbox": xyxy.tolist(),
-                        "score": score,
-                        "center": center
+                        "name": name, "bbox": xyxy.tolist(), "score": score, "center": center
                     })
         recognize_ms = (time.time() - recognize_start) * 1000.0
         self.last_detect_ms = detect_ms
@@ -296,7 +439,6 @@ class AIPipeline(threading.Thread):
 
         print(f"[DEBUG] TRACKING: found {len(all_faces)} registered faces, locked='{self.locked_identity}'")
 
-        # Kiểm tra xem target hiện tại có trong danh sách không
         current_found = None
         for cand in candidates:
             if cand[1] == self.locked_identity:
@@ -304,7 +446,6 @@ class AIPipeline(threading.Thread):
                 break
 
         if current_found is not None:
-            # Mặt vẫn nhận diện được bình thường -- đường đi cũ, không đổi.
             self.lost_counter = 0
             self.lock_mode = "FACE"
             bbox, name, score, center = current_found
@@ -313,13 +454,11 @@ class AIPipeline(threading.Thread):
             kx, ky = self.kalman.predict_and_correct(center[0], center[1])
             self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
             self._run_exercise_tracking(frame, self.target_bbox, center=(kx, ky))
-            # KHÔNG CHUYỂN TARGET KHI CÓ NGƯỜI KHÁC – chỉ chuyển khi target hiện tại biến mất
+            if self._check_dynamic_boundary_exit():
+                self._declare_lost_with_handoff("TARGET_LOST_BOUNDARY")
+                return
             return
 
-        # Không nhận diện được mặt target ở frame này -- thử khoá theo
-        # THÂN NGƯỜI (người đó có thể đã đi xa hơn, mặt quá nhỏ/lệch góc
-        # để nhận diện, nhưng vẫn còn trong khung hình ở vị trí gần với
-        # bbox cũ).
         body_bbox = self._find_body_continuity(frame)
         if body_bbox is not None:
             self.lost_counter = 0
@@ -331,25 +470,67 @@ class AIPipeline(threading.Thread):
             kx, ky = self.kalman.predict_and_correct(cx, cy)
             self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
             self._run_exercise_tracking(frame, self.target_bbox, center=(kx, ky))
+            if self._check_dynamic_boundary_exit():
+                self._declare_lost_with_handoff("TARGET_LOST_BOUNDARY")
+                return
             return
 
-        # Cả mặt lẫn thân đều không tìm thấy -- thực sự có thể đã mất.
+        shape_bbox, shape_name, shape_score = self._find_identity_by_body_shape(
+            frame, candidate_names=[self.locked_identity]
+        )
+        if shape_bbox is not None:
+            self.lost_counter = 0
+            self.lock_mode = "BODY_SHAPE"
+            cx = (shape_bbox[0] + shape_bbox[2]) // 2
+            cy = (shape_bbox[1] + shape_bbox[3]) // 2
+            self.target_bbox = shape_bbox
+            self.target_center = (cx, cy)
+            kx, ky = self.kalman.predict_and_correct(cx, cy)
+            self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+            self._run_exercise_tracking(frame, self.target_bbox, center=(kx, ky))
+            self.logger.log("BODY_SHAPE_MATCH", name=self.locked_identity, similarity=f"{shape_score:.2f}", room=self.room_name)
+            if self._check_dynamic_boundary_exit():
+                self._declare_lost_with_handoff("TARGET_LOST_BOUNDARY")
+                return
+            return
+
         self.lost_counter += 1
         if self.lost_counter >= self.LOST_THRESHOLD:
-            self.current_state = self.STATE_LOST
-            self.logger.log("TARGET_LOST", name=self.locked_identity, room=self.room_name)
-            print(f"[FSM:{self.room_name}] Lost '{self.locked_identity}' -> LOST")
-            exercise_manager.set_online(self.locked_identity, False)
-            self._clear_target()
-        # else: vẫn trong thời gian chờ (grace period), giữ nguyên output cũ.
+            self._declare_lost_with_handoff("TARGET_LOST")
+
+    def _find_identity_by_body_shape(self, frame, candidate_names=None, min_similarity=None):
+        try:
+            person_results = self.yolo_person(frame, verbose=False, device=self.device, classes=[0])
+        except Exception as e:
+            print(f"[AI:{self.room_name}] body-shape match yolo_person error: {e}")
+            return None, None, 0.0
+
+        if min_similarity is None:
+            min_similarity = (
+                config.BODY_MATCH_MIN_SIMILARITY if candidate_names
+                else config.BODY_MATCH_MIN_SIMILARITY_COLD
+            )
+        min_samples = getattr(config, "BODY_MATCH_MIN_SAMPLES", 5)
+
+        best_box, best_name, best_score = None, None, -1.0
+        for r in person_results:
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                crop = _crop_safe(frame, upper_body_box(xyxy, config.UPPER_BODY_CROP_RATIO))
+                features = self.body_extractor.extract(crop)
+                if features is None:
+                    continue
+                name, score = face_database.match_body_profile(
+                    features, candidate_names=candidate_names, min_sample_count=min_samples
+                )
+                if name is not None and score > best_score:
+                    best_box, best_name, best_score = xyxy, name, score
+
+        if best_box is not None and best_score >= min_similarity:
+            return list(best_box), best_name, best_score
+        return None, None, 0.0
 
     def _find_body_continuity(self, frame):
-        """
-        Khi mặt của target đang khoá không còn nhận diện được ở frame này,
-        thử khoá tiếp theo THÂN NGƯỜI: chạy YOLO-person, so khớp IOU với
-        bbox cuối cùng đã biết. Trả về bbox mới (list[int,4]) nếu khớp đủ
-        tốt, ngược lại trả về None.
-        """
         if self.target_bbox is None:
             return None
         try:
@@ -373,28 +554,9 @@ class AIPipeline(threading.Thread):
         return None
 
     def _run_exercise_tracking(self, frame, bbox, center=None):
-        """
-        Feed the currently-locked (recognized, registered) person's body
-        crop into this room's PoseEstimator every frame. This now covers
-        two independent things:
+        if self.POSE_EVERY_N_FRAMES > 1 and self._frame_counter % self.POSE_EVERY_N_FRAMES != 0:
+            return
 
-          1) Exercise rep counting (squat/pushup), scored against
-             exercise_manager ONLY if that person currently has an
-             assignment -- unchanged behavior.
-          2) General behavior recognition (Đứng/Di chuyển/Nhảy/Giơ tay/
-             Nằm), which always runs for ANY recognized registered
-             person, assignment or not -- these are ordinary behaviors,
-             not exercises, so they're tracked unconditionally in
-             behavior_manager.
-
-        NOTE on CPU cost: this used to skip mediapipe entirely for
-        unassigned people to save CPU. Now that behavior recognition must
-        run for everyone recognized (not just assigned people), mediapipe
-        runs on every frame a registered person is locked, assigned or
-        not. If that turns out too heavy running multiple rooms at once,
-        consider throttling this call (e.g. every 2nd/3rd frame) rather
-        than skipping it outright.
-        """
         name = self.locked_identity
         if name is None:
             return
@@ -403,32 +565,20 @@ class AIPipeline(threading.Thread):
         if is_assigned:
             exercise_manager.set_online(name, True)
 
-        # IMPORTANT: pass the Kalman-SMOOTHED center (the same one drawn as
-        # the crosshair on the dashboard), not the raw per-frame detection
-        # center. Raw YOLO box centers jitter by several pixels frame-to-
-        # frame even while the person stands still, which used to make
-        # jump/move detection fire randomly on pure detector noise.
         crop = _crop_safe(frame, bbox)
         result = self.pose_estimator.process(name, crop, bbox_center=center)
 
         if is_assigned and result["rep_completed"]:
             exercise_manager.register_rep(name, result["rep_completed"])
-            self.logger.log(
-                "EXERCISE_REP", name=name, exercise=result["rep_completed"], room=self.room_name
-            )
+            self.logger.log("EXERCISE_REP", name=name, exercise=result["rep_completed"], room=self.room_name)
             print(f"[Exercise:{self.room_name}] '{name}' completed a {result['rep_completed']} rep")
 
         if result["behavior_events"]:
             behavior_manager.record_many(name, result["behavior_events"])
-            self.logger.log(
-                "BEHAVIOR_DETECTED",
-                name=name,
-                events=",".join(result["behavior_events"]),
-                room=self.room_name,
-            )
+            self.logger.log("BEHAVIOR_DETECTED", name=name, events=",".join(result["behavior_events"]), room=self.room_name)
 
     # =============================================
-    # LOST – tìm lại bất kỳ ai đã đăng ký
+    # LOST -- tìm lại bất kỳ ai đã đăng ký
     # =============================================
     def _step_lost(self, frame):
         results = self.yolo_face(frame, verbose=False, device=self.device)
@@ -444,26 +594,21 @@ class AIPipeline(threading.Thread):
                     cx = (xyxy[0] + xyxy[2]) // 2
                     cy = (xyxy[1] + xyxy[3]) // 2
                     all_faces.append({
-                        "name": name,
-                        "bbox": xyxy.tolist(),
-                        "score": score,
-                        "center": (cx, cy)
+                        "name": name, "bbox": xyxy.tolist(), "score": score, "center": (cx, cy)
                     })
         with self._lock:
             self.all_faces = all_faces
 
         print(f"[DEBUG] LOST: found {len(all_faces)} registered faces")
 
-        # Tìm target cũ hoặc bất kỳ ai
         if all_faces:
-            # Ưu tiên target cũ nếu có
             chosen = None
             for face in all_faces:
                 if face["name"] == self.locked_identity:
                     chosen = face
                     break
             if chosen is None:
-                chosen = all_faces[0]  # lấy người đầu tiên
+                chosen = all_faces[0]
             name = chosen["name"]
             bbox = chosen["bbox"]
             center = chosen["center"]
@@ -478,6 +623,33 @@ class AIPipeline(threading.Thread):
             self.lost_counter = 0
             self.logger.log("TARGET_REACQUIRED", name=name, room=self.room_name)
             print(f"[FSM:{self.room_name}] Reacquired '{name}' -> TRACKING")
+            return
+
+        shape_bbox = shape_name = None
+        shape_score = 0.0
+        if self._last_locked_identity is not None:
+            shape_bbox, shape_name, shape_score = self._find_identity_by_body_shape(
+                frame, candidate_names=[self._last_locked_identity]
+            )
+        if shape_bbox is None:
+            shape_bbox, shape_name, shape_score = self._find_identity_by_body_shape(
+                frame, candidate_names=None
+            )
+
+        if shape_bbox is not None:
+            cx = (shape_bbox[0] + shape_bbox[2]) // 2
+            cy = (shape_bbox[1] + shape_bbox[3]) // 2
+            self.locked_identity = shape_name
+            self.target_bbox = shape_bbox
+            self.target_center = (cx, cy)
+            self.lock_mode = "BODY_SHAPE"
+            self.kalman.reset()
+            kx, ky = self.kalman.predict_and_correct(cx, cy)
+            self._set_output(True, self.target_bbox, self.target_bbox, (kx, ky))
+            self.current_state = self.STATE_TRACKING
+            self.lost_counter = 0
+            self.logger.log("TARGET_REACQUIRED_BY_BODY", name=shape_name, similarity=f"{shape_score:.2f}", room=self.room_name)
+            print(f"[FSM:{self.room_name}] Reacquired '{shape_name}' by body shape (similarity={shape_score:.2f}) -> TRACKING")
         else:
             self._clear_target()
 
@@ -504,4 +676,13 @@ class AIPipeline(threading.Thread):
             return self.last_detect_ms, self.last_recognize_ms
 
     def stop(self):
-        self.running = False    
+        self.running = False
+        try:
+            self.body_extractor.close()
+        except Exception:
+            pass
+        if self.servo is not None:
+            try:
+                self.servo.close()
+            except Exception:
+                pass

@@ -20,7 +20,7 @@ const capturedPreview = document.getElementById('captured-preview');
 
 // --- Webcam workflow state ---
 let stream = null;
-let capturedImagesArray = []; // up to 5 base64 image strings
+let capturedImagesArray = [];
 const faceAngles = [
     "Look straight ahead",
     "Turn head to the Left",
@@ -28,7 +28,13 @@ const faceAngles = [
     "Tilt head Up",
     "Tilt head Down"
 ];
-let currentAngleIndex = 0; // which angle is currently being requested
+let currentAngleIndex = 0;
+
+// --- Body Registration Workflow State ---
+let bodyImagesArray = [];
+const bodyAngles = ["Phía trước (Mặt hướng vào camera)", "Phía sau (Quay lưng lại)"];
+let currentBodyAngleIndex = 0;
+let currentRegisteredName = "";
 
 // Tab switching
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -41,14 +47,13 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 
         if (tab === 'webcam') {
             startWebcam();
-            resetWebcamWorkflow(); // restart the multi-angle capture workflow
+            resetWebcamWorkflow();
         } else {
             stopWebcam();
         }
     });
 });
 
-// Open/close the webcam stream
 function startWebcam() {
     if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
         navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
@@ -72,7 +77,9 @@ function stopWebcam() {
     }
 }
 
-// Refresh the multi-angle workflow UI to match current state
+// ==========================================
+// FACE WORKFLOW
+// ==========================================
 function updateWebcamWorkflowUI() {
     captureCountSpan.textContent = `Captured: ${capturedImagesArray.length}/5`;
 
@@ -83,45 +90,42 @@ function updateWebcamWorkflowUI() {
     } else {
         angleHint.textContent = "🎯 All 5 angles captured!";
         angleHint.style.color = "#28a745";
-        captureBtn.disabled = true; // lock further capture once the goal is met
+        captureBtn.disabled = true;
     }
 }
 
-// Reset the workflow back to its initial state
 function resetWebcamWorkflow() {
     capturedImagesArray = [];
     currentAngleIndex = 0;
-    capturedPreview.innerHTML = ''; // clear the preview grid
-    webcamStatus.textContent = 'Center your face on screen and click the button to capture the first angle.';
+    capturedPreview.innerHTML = '';
+    webcamStatus.textContent = 'Center your face and click the button to capture the first angle.';
     webcamStatus.style.color = '#555';
     updateWebcamWorkflowUI();
+    
+    // Hiện phần Face, ẩn phần Body
+    document.getElementById('face-registration-step').style.display = 'block';
+    document.getElementById('webcam-name-input').style.display = 'flex';
+    document.getElementById('body-registration-panel').style.display = 'none';
 }
 
-// "Start over" button: clears all previously captured images
 resetCaptureBtn.addEventListener('click', function() {
-    if (capturedImagesArray.length === 0) {
-        webcamStatus.textContent = "Nothing captured yet, you can go ahead and capture.";
-        return;
-    }
+    if (capturedImagesArray.length === 0) return;
     if (confirm("This will clear all the angles captured so far. Start over?")) {
         resetWebcamWorkflow();
     }
 });
 
-// Capture the current frame for the current requested angle
 captureBtn.addEventListener('click', function() {
     if (currentAngleIndex >= faceAngles.length || !stream) return;
 
-    // Size the hidden canvas to match the actual video stream
     webcamCanvas.width = video.videoWidth || 640;
     webcamCanvas.height = video.videoHeight || 480;
     webcamCtx.drawImage(video, 0, 0, webcamCanvas.width, webcamCanvas.height);
     const dataUrl = webcamCanvas.toDataURL('image/jpeg');
 
-    webcamStatus.textContent = "⏳ Validating face for this angle...";
+    webcamStatus.textContent = "⏳ Validating face...";
     webcamStatus.style.color = "#007bff";
 
-    // Send the single frame to the server to confirm it contains a face
     fetch('/get_landmarks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -130,57 +134,35 @@ captureBtn.addEventListener('click', function() {
     .then(res => res.json())
     .then(data => {
         if (data.status === 'success') {
-            // Face found -> queue the image
             capturedImagesArray.push(dataUrl);
-
-            // Build the preview card with the angle label
             const cardWrapper = document.createElement('div');
-            cardWrapper.style.position = 'relative';
-            cardWrapper.style.border = '2px solid #28a745';
-            cardWrapper.style.borderRadius = '5px';
-            cardWrapper.style.overflow = 'hidden';
-
+            cardWrapper.style.cssText = 'position: relative; border: 2px solid #28a745; border-radius: 5px; overflow: hidden; width: 120px; height: 90px;';
             const previewImg = document.createElement('img');
             previewImg.src = dataUrl;
-            previewImg.style.width = '120px';
-            previewImg.style.height = '90px';
-            previewImg.style.objectFit = 'cover';
-            previewImg.style.display = 'block';
-
+            previewImg.style.cssText = 'width: 120px; height: 90px; object-fit: cover; display: block;';
             const angleLabel = document.createElement('div');
             angleLabel.textContent = faceAngles[currentAngleIndex];
-            angleLabel.style.position = 'absolute';
-            angleLabel.style.bottom = '0';
-            angleLabel.style.width = '100%';
-            angleLabel.style.background = 'rgba(0, 123, 255, 0.85)';
-            angleLabel.style.color = 'white';
-            angleLabel.style.fontSize = '10px';
-            angleLabel.style.textAlign = 'center';
-            angleLabel.style.padding = '2px 0';
-
+            angleLabel.style.cssText = 'position: absolute; bottom: 0; width: 100%; background: rgba(0, 123, 255, 0.85); color: white; font-size: 10px; text-align: center; padding: 2px 0;';
             cardWrapper.appendChild(previewImg);
             cardWrapper.appendChild(angleLabel);
             capturedPreview.appendChild(cardWrapper);
 
-            webcamStatus.textContent = `✅ Captured angle: ${faceAngles[currentAngleIndex]}`;
+            webcamStatus.textContent = `✅ Captured: ${faceAngles[currentAngleIndex]}`;
             webcamStatus.style.color = '#28a745';
-
-            // Move to the next angle; each angle is captured exactly once
             currentAngleIndex++;
             updateWebcamWorkflowUI();
         } else {
-            // No face found -> keep the same angle and ask to retry
-            webcamStatus.textContent = `❌ Error: ${data.message}. Please re-adjust and capture: [ ${faceAngles[currentAngleIndex]} ]`;
+            webcamStatus.textContent = `❌ Error: ${data.message}. Please capture: [ ${faceAngles[currentAngleIndex]} ]`;
             webcamStatus.style.color = '#dc3545';
         }
     })
     .catch(err => {
-        webcamStatus.textContent = 'Lost connection to the API server: ' + err.message;
+        webcamStatus.textContent = 'API error: ' + err.message;
         webcamStatus.style.color = '#dc3545';
     });
 });
 
-// Send the 5 captured images to the backend for embedding + storage
+// SAVE FACE -> TRANSITION TO BODY
 saveWebcamBtn.addEventListener('click', function() {
     const name = webcamName.value.trim();
     if (!name) {
@@ -189,12 +171,12 @@ saveWebcamBtn.addEventListener('click', function() {
         return;
     }
     if (capturedImagesArray.length < 5) {
-        webcamStatus.textContent = `❌ You haven't captured all 5 required angles yet (currently: ${capturedImagesArray.length}/5).`;
+        webcamStatus.textContent = `❌ You haven't captured all 5 angles yet (${capturedImagesArray.length}/5).`;
         webcamStatus.style.color = '#dc3545';
         return;
     }
 
-    webcamStatus.textContent = "⏳ Server is computing embeddings...";
+    webcamStatus.textContent = "⏳ Saving face data...";
     webcamStatus.style.color = "#007bff";
 
     fetch('/register_final', {
@@ -205,10 +187,17 @@ saveWebcamBtn.addEventListener('click', function() {
     .then(res => res.json())
     .then(data => {
         if (data.status === 'success') {
-            webcamStatus.textContent = `🎉 Saved successfully! [ ${name} ]'s dataset is ready.`;
+            currentRegisteredName = name; // Lưu tên để dùng cho bước body
+            webcamStatus.textContent = `🎉 Face data saved! Preparing body registration...`;
             webcamStatus.style.color = '#28a745';
-            webcamName.value = ''; // clear the name field
-            resetWebcamWorkflow();  // reset for the next registration
+            
+            // Chỉ ẩn khối điều khiển Face, KHÔNG ẩn video nữa
+            setTimeout(() => {
+                document.getElementById('face-registration-step').style.display = 'none';
+                document.getElementById('webcam-name-input').style.display = 'none';
+                document.getElementById('body-registration-panel').style.display = 'block';
+                resetBodyWorkflow();
+            }, 1500);
         } else {
             webcamStatus.textContent = '❌ Server error: ' + data.message;
             webcamStatus.style.color = '#dc3545';
@@ -220,7 +209,145 @@ saveWebcamBtn.addEventListener('click', function() {
     });
 });
 
-// --- Static image upload tab ---
+
+// ==========================================
+// BODY WORKFLOW
+// ==========================================
+function updateBodyWorkflowUI() {
+    document.getElementById('body-count').textContent = `Đã chụp: ${bodyImagesArray.length}/2`;
+    if (currentBodyAngleIndex < bodyAngles.length) {
+        document.getElementById('body-hint').textContent = `Yêu cầu: ${bodyAngles[currentBodyAngleIndex]}`;
+        document.getElementById('body-hint').style.color = "#007bff";
+        document.getElementById('captureBodyFrontBtn').disabled = currentBodyAngleIndex !== 0;
+        document.getElementById('captureBodyBackBtn').disabled = currentBodyAngleIndex !== 1;
+    } else {
+        document.getElementById('body-hint').textContent = "🎯 Đã chụp đủ 2 hướng!";
+        document.getElementById('body-hint').style.color = "#28a745";
+        document.getElementById('captureBodyFrontBtn').disabled = true;
+        document.getElementById('captureBodyBackBtn').disabled = true;
+        document.getElementById('saveBodyBtn').disabled = false;
+    }
+}
+
+function resetBodyWorkflow() {
+    bodyImagesArray = [];
+    currentBodyAngleIndex = 0;
+    document.getElementById('body-preview').innerHTML = '';
+    document.getElementById('body-status').textContent = 'Lùi xa lại để thấy nửa thân trên, sau đó bấm "1. Chụp phía trước".';
+    document.getElementById('body-status').style.color = '#555';
+    document.getElementById('saveBodyBtn').disabled = true;
+    updateBodyWorkflowUI();
+}
+
+document.getElementById('captureBodyFrontBtn').addEventListener('click', function() {
+    captureBodyImage('front');
+});
+
+document.getElementById('captureBodyBackBtn').addEventListener('click', function() {
+    captureBodyImage('back');
+});
+
+function captureBodyImage(type) {
+    if (!stream) return;
+
+    webcamCanvas.width = video.videoWidth || 640;
+    webcamCanvas.height = video.videoHeight || 480;
+    webcamCtx.drawImage(video, 0, 0, webcamCanvas.width, webcamCanvas.height);
+    const dataUrl = webcamCanvas.toDataURL('image/jpeg');
+
+    document.getElementById('body-status').textContent = "⏳ Đang kiểm tra ảnh...";
+    document.getElementById('body-status').style.color = "#007bff";
+
+    if (type === 'front') {
+        fetch('/get_landmarks', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: dataUrl })
+        })
+        .then(res => res.json())
+        .then(data => {
+            if (data.status === 'success') {
+                addBodyImage(dataUrl, bodyAngles[currentBodyAngleIndex]);
+            } else {
+                document.getElementById('body-status').textContent = `❌ Lỗi: ${data.message}. Ảnh phía trước BẮT BUỘC phải thấy mặt.`;
+                document.getElementById('body-status').style.color = '#dc3545';
+            }
+        });
+    } else {
+        addBodyImage(dataUrl, bodyAngles[currentBodyAngleIndex]);
+    }
+}
+
+function addBodyImage(dataUrl, label) {
+    bodyImagesArray.push(dataUrl);
+    
+    const cardWrapper = document.createElement('div');
+    cardWrapper.style.cssText = 'position: relative; border: 2px solid #28a745; border-radius: 5px; overflow: hidden; width: 120px; height: 90px;';
+    
+    const previewImg = document.createElement('img');
+    previewImg.src = dataUrl;
+    previewImg.style.cssText = 'width: 120px; height: 90px; object-fit: cover; display: block;';
+    
+    const angleLabel = document.createElement('div');
+    angleLabel.textContent = label;
+    angleLabel.style.cssText = 'position: absolute; bottom: 0; width: 100%; background: rgba(40, 167, 69, 0.85); color: white; font-size: 10px; text-align: center; padding: 2px 0;';
+    
+    cardWrapper.appendChild(previewImg);
+    cardWrapper.appendChild(angleLabel);
+    document.getElementById('body-preview').appendChild(cardWrapper);
+
+    document.getElementById('body-status').textContent = `✅ Đã chụp: ${label}`;
+    document.getElementById('body-status').style.color = '#28a745';
+    
+    currentBodyAngleIndex++;
+    updateBodyWorkflowUI();
+}
+
+document.getElementById('resetBodyBtn').addEventListener('click', function() {
+    if (bodyImagesArray.length > 0 && confirm("Xóa ảnh cơ thể đã chụp và làm lại?")) {
+        resetBodyWorkflow();
+    }
+});
+
+document.getElementById('saveBodyBtn').addEventListener('click', function() {
+    if (bodyImagesArray.length < 2) return;
+    
+    document.getElementById('body-status').textContent = "⏳ Đang lưu đặc trưng cơ thể...";
+    document.getElementById('body-status').style.color = "#007bff";
+    document.getElementById('saveBodyBtn').disabled = true;
+
+    fetch('/register_body', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: currentRegisteredName, images: bodyImagesArray })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.status === 'success') {
+            document.getElementById('body-status').innerHTML = `🎉 ${data.message}<br><b>Hoàn tất đăng ký!</b>`;
+            document.getElementById('body-status').style.color = '#28a745';
+            
+            setTimeout(() => {
+                resetWebcamWorkflow();
+                webcamName.value = '';
+            }, 3000);
+        } else {
+            document.getElementById('body-status').textContent = '❌ ' + data.message;
+            document.getElementById('body-status').style.color = '#dc3545';
+            document.getElementById('saveBodyBtn').disabled = false;
+        }
+    })
+    .catch(err => {
+        document.getElementById('body-status').textContent = 'Mất kết nối: ' + err.message;
+        document.getElementById('body-status').style.color = '#dc3545';
+        document.getElementById('saveBodyBtn').disabled = false;
+    });
+});
+
+
+// ==========================================
+// STATIC IMAGE UPLOAD TAB
+// ==========================================
 imageInput.addEventListener('change', function(e) {
     const file = e.target.files[0];
     if (!file) return;
@@ -241,7 +368,6 @@ imageInput.addEventListener('change', function(e) {
             .then(res => res.json())
             .then(data => {
                 if (data.status === 'success') {
-                    // Draw the extracted landmarks on top of the canvas
                     ctx.strokeStyle = 'red';
                     ctx.lineWidth = 2;
                     data.landmarks.forEach(pt => {
